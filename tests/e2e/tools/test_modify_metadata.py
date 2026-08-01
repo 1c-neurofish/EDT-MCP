@@ -106,7 +106,8 @@ def test_modify_normalizes_yo_in_synonym_and_comment_by_default():
     r = call("modify_metadata", {
         "projectName": PROJECT, "fqn": "Catalog.Catalog",
         "properties": [
-            {"name": "synonym", "value": syn_yo, "language": "ru"},
+            # 'en' is the fixture's only declared locale; 'ru' is now rejected (issue #298).
+            {"name": "synonym", "value": syn_yo, "language": "en"},
             {"name": "comment", "value": com_yo},
         ],
     })
@@ -1679,3 +1680,322 @@ def test_xdto_namespace_change_cascades_into_referencing_package():
         "P own targetNamespace must move")
     if old_ns in p_text:
         raise AssertionError("P own self-reference must be rewritten too: %r" % p_text)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Localized properties must name a DECLARED locale — issue #298.
+# ──────────────────────────────────────────────────────────────────────────────
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_rejects_a_localized_property_in_an_undeclared_locale():
+    """Issue #298: modify_metadata accepted any 'language' code and stored the value under it, where
+    nothing ever reads it. The fixture declares only 'en'."""
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "synonym", "value": "Marchandises", "language": "fr_CA"}],
+    })
+    e = assert_error(r, "a localized property in an undeclared locale must be refused")
+    assert_error_quality(e, names=["fr_CA"], suggests=["en"],
+                         ctx="the error must name the bad code AND list what the configuration declares")
+    assert_no_diff("a rejected localized write must not change the project")
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_reports_the_locale_used_and_the_ones_still_untranslated():
+    # Issue #298 parts 2-3. A second language is added, then the SAME property is translated into
+    # it - proving the report is read from the object (a modify target may already carry other
+    # translations), not guessed. The fixture's configuration is named in 'en' only, so that second
+    # language is declared but NOT in use: it is not owed a translation, and writing into it is
+    # flagged instead, so the agent asks the user before populating it.
+    assert_ok(call("create_metadata", {"projectName": PROJECT, "fqn": "Language.Z298FrOnModify"}),
+              "add a second language to the configuration")
+    wait_for_project_ready()
+    assert_ok(call("modify_metadata", {"projectName": PROJECT, "fqn": "Language.Z298FrOnModify",
+                                       "properties": [{"name": "languageCode", "value": "fr"}]}),
+              "give the second language its code")
+    wait_for_project_ready()
+
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "synonym", "value": "Goods", "language": "en"}],
+    })
+    assert_ok(r, "set the synonym in the first declared locale")
+    assert r.structured.get("language") == "en", \
+        "the result must echo the locale used: %r" % (r.structured,)
+    assert r.structured.get("localesMissing") == [], \
+        "a language the configuration is not translated into is not owed one: %r" % (r.structured,)
+    assert "localeUnusedInConfiguration" not in r.structured, \
+        "a write in the language the configuration DOES use must not be questioned: %r" % (r.structured,)
+    wait_for_project_ready()
+
+    r2 = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "synonym", "value": "Marchandises", "language": "fr"}],
+    })
+    assert_ok(r2, "translate the same property into the second locale")
+    assert r2.structured.get("localesMissing") == [], \
+        "with every locale in USE translated the list must be empty: %r" % (r2.structured,)
+    assert r2.structured.get("localeUnusedInConfiguration") is True, \
+        "writing into a language the configuration does not use must be flagged: %r" % (r2.structured,)
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_reports_the_locales_left_holding_the_previous_text():
+    # The case the rule is really about: you RENAME a synonym in one language and the other
+    # languages keep the old wording. They are not "missing" - they have a value - so only a
+    # separate list can surface them.
+    assert_ok(call("create_metadata", {"projectName": PROJECT, "fqn": "Language.Z298StaleFr"}),
+              "add a second language to the configuration")
+    wait_for_project_ready()
+    assert_ok(call("modify_metadata", {"projectName": PROJECT, "fqn": "Language.Z298StaleFr",
+                                       "properties": [{"name": "languageCode", "value": "fr"}]}),
+              "give the second language its code")
+    wait_for_project_ready()
+
+    # Both languages carry a synonym...
+    for code, text in (("en", "Goods"), ("fr", "Marchandises")):
+        assert_ok(call("modify_metadata", {
+            "projectName": PROJECT, "fqn": "Catalog.Catalog",
+            "properties": [{"name": "synonym", "value": text, "language": code}]}),
+            "seed the synonym in %s" % code)
+        wait_for_project_ready()
+
+    # ... and now only ONE of them is renamed: the other still says "Marchandises".
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "synonym", "value": "Wares", "language": "en"}],
+    })
+    assert_ok(r, "rename the synonym in one language only")
+    assert r.structured.get("localesStale") == ["fr"], \
+        "the language left holding the previous text must be reported: %r" % (r.structured,)
+    assert r.structured.get("localesMissing") == [], \
+        "a language that HAS text is not missing one: %r" % (r.structured,)
+    wait_for_project_ready()
+
+    # Writing both in one call leaves nothing behind.
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "synonym", "value": "Items", "language": "en"},
+                       {"name": "synonym", "value": "Articles", "language": "fr"}],
+    })
+    assert_ok(r, "translate both languages in the same call")
+    assert "localesStale" not in r.structured, \
+        "a language written by the same call is not stale: %r" % (r.structured,)
+    wait_for_project_ready()
+
+    # COMPLETING a translation is not the same as changing one: filling a language that was empty
+    # leaves the others exactly as current as they were, so nothing went stale. (The attribute is
+    # used here because its synonym has no text in either language yet.)
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog.Attribute.Attribute",
+        "properties": [{"name": "synonym", "value": "Titre", "language": "fr"}],
+    })
+    assert_ok(r, "fill in a language this property had no text in")
+    assert "localesStale" not in r.structured, \
+        "filling a missing translation must not make the others stale: %r" % (r.structured,)
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_rewriting_the_same_text_does_not_report_stale():
+    # Idempotent rewrite: writing the EXACT SAME text again is not a replace - the other language's
+    # translation still describes the current value, so it must not be reported stale (the old
+    # behaviour flagged the other language on every rewrite, whatever the value - issue #298 review).
+    assert_ok(call("create_metadata", {"projectName": PROJECT, "fqn": "Language.Z298IdemStaleFr"}),
+              "add a second language to the configuration")
+    wait_for_project_ready()
+    assert_ok(call("modify_metadata", {"projectName": PROJECT, "fqn": "Language.Z298IdemStaleFr",
+                                       "properties": [{"name": "languageCode", "value": "fr"}]}),
+              "give the second language its code")
+    wait_for_project_ready()
+
+    # Both languages carry a synonym...
+    for code, text in (("en", "Goods"), ("fr", "Marchandises")):
+        assert_ok(call("modify_metadata", {
+            "projectName": PROJECT, "fqn": "Catalog.Catalog",
+            "properties": [{"name": "synonym", "value": text, "language": code}]}),
+            "seed the synonym in %s" % code)
+        wait_for_project_ready()
+
+    # ... and now 'en' is written again with the IDENTICAL text: nothing actually changed, so 'fr'
+    # still describes the current value and must not be flagged as stale.
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "synonym", "value": "Goods", "language": "en"}],
+    })
+    assert_ok(r, "rewrite the synonym with the identical text")
+    # A positive signal FIRST: the localized-write report engine actually ran (not silently absent -
+    # a broken/no-op report would also satisfy a bare "not in" check below).
+    assert r.structured.get("language") == "en", \
+        "the localized report must have run for this write: %r" % (r.structured,)
+    assert "localesStale" not in r.structured, \
+        "rewriting the SAME text must not mark the other language stale: %r" % (r.structured,)
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_putting_the_old_text_back_in_one_call_reports_nothing_stale():
+    # A batch may write the same property and language more than once. What can make another
+    # language out of date is where the value ENDS UP, not what it passed through: writing a new
+    # name and then putting the original back leaves the property exactly as it was.
+    assert_ok(call("create_metadata", {"projectName": PROJECT, "fqn": "Language.Z298BackFr"}),
+              "add a second language to the configuration")
+    wait_for_project_ready()
+    assert_ok(call("modify_metadata", {"projectName": PROJECT, "fqn": "Language.Z298BackFr",
+                                       "properties": [{"name": "languageCode", "value": "fr"}]}),
+              "give the second language its code")
+    wait_for_project_ready()
+    for code, text in (("en", "Goods"), ("fr", "Marchandises")):
+        assert_ok(call("modify_metadata", {
+            "projectName": PROJECT, "fqn": "Catalog.Catalog",
+            "properties": [{"name": "synonym", "value": text, "language": code}]}),
+            "seed the synonym in %s" % code)
+        wait_for_project_ready()
+
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "synonym", "value": "Wares", "language": "en"},
+                       {"name": "synonym", "value": "Goods", "language": "en"}],
+    })
+    assert_ok(r, "change the synonym and put the original back in the same call")
+    assert "localesStale" not in r.structured, \
+        "the value ended where it started, so nothing behind it went stale: %r" % (r.structured,)
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_cross_property_locales_stale_are_reported_per_property():
+    # Two DIFFERENT localized properties on the SAME form member: change 'title' in en and 'toolTip'
+    # in fr in ONE call. Staleness is decided PER PROPERTY, so title's untouched 'fr' and toolTip's
+    # untouched 'en' must BOTH surface. The old behaviour excluded every language the call touched
+    # ANYWHERE (a project-wide set), which would wrongly hide both - title never touched fr, and
+    # toolTip never touched en, so neither is "a language this call wrote".
+    assert_ok(call("create_metadata", {"projectName": PROJECT, "fqn": "Language.Z298CrossPropFr"}),
+              "add a second language to the configuration")
+    wait_for_project_ready()
+    assert_ok(call("modify_metadata", {"projectName": PROJECT, "fqn": "Language.Z298CrossPropFr",
+                                       "properties": [{"name": "languageCode", "value": "fr"}]}),
+              "give the second language its code")
+    wait_for_project_ready()
+
+    fqn = "Catalog.Catalog.Form.ItemForm.Field.Description"
+    # Seed BOTH 'title' and 'toolTip' in BOTH languages first (get_metadata_details(assignable:true)
+    # on this fqn lists 'toolTip' as its own LOCALIZED_STRING property, distinct from 'title').
+    for code, title_text, tip_text in (("en", "Description", "Enter a description"),
+                                        ("fr", "Description FR", "Entrez une description")):
+        assert_ok(call("modify_metadata", {
+            "projectName": PROJECT, "fqn": fqn,
+            "properties": [{"name": "title", "value": title_text, "language": code},
+                           {"name": "toolTip", "value": tip_text, "language": code}]}),
+            "seed title + toolTip in %s" % code)
+        wait_for_project_ready()
+
+    # One call: change 'title' in en AND 'toolTip' in fr, both to NEW values.
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": fqn,
+        "properties": [{"name": "title", "value": "New description", "language": "en"},
+                       {"name": "toolTip", "value": "Nouvelle description", "language": "fr"}],
+    })
+    assert_ok(r, "change title(en) and toolTip(fr) in the same call")
+    assert r.structured.get("localesMissing") == [], \
+        "every in-use language already has text for both properties: %r" % (r.structured,)
+    stale = sorted(r.structured.get("localesStale") or [])
+    assert stale == ["en", "fr"], \
+        "title's untouched fr AND toolTip's untouched en must both be reported stale: %r" % (r.structured,)
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_without_a_localized_property_reports_no_locales():
+    # The localized report belongs to a localized write: a plain scalar edit must not grow the
+    # payload (its absence is what tells a caller no localized value was touched).
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog",
+        "properties": [{"name": "comment", "value": "plain scalar edit"}],
+    })
+    assert_ok(r, "a scalar-only modify")
+    assert "localesMissing" not in r.structured, \
+        "a non-localized modify must not report locales: %r" % (r.structured,)
+    assert "language" not in r.structured, \
+        "a non-localized modify must not echo a locale: %r" % (r.structured,)
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_form_member_reports_the_locale_used_and_the_ones_still_untranslated():
+    # A form member's title is a localized property, and that path builds its OWN result - it must
+    # carry the same report as the mdclass path (issue #298).
+    assert_ok(call("create_metadata", {"projectName": PROJECT, "fqn": "Language.Z298FrOnFormMember"}),
+              "add a second language to the configuration")
+    wait_for_project_ready()
+    assert_ok(call("modify_metadata", {"projectName": PROJECT, "fqn": "Language.Z298FrOnFormMember",
+                                       "properties": [{"name": "languageCode", "value": "fr"}]}),
+              "give the second language its code")
+    wait_for_project_ready()
+
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog.Form.ItemForm.Field.Description",
+        "properties": [{"name": "title", "value": "Description", "language": "en"}],
+    })
+    assert_ok(r, "set a form field's title")
+    assert r.structured.get("language") == "en",         "the form-member modify must echo the locale used: %r" % (r.structured,)
+    assert r.structured.get("localesMissing") == [],         "the form-member modify must carry the report - empty, the second language is unused: %r" % (r.structured,)
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_form_member_rejects_a_title_in_an_undeclared_locale():
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Catalog.Catalog.Form.ItemForm.Field.Description",
+        "properties": [{"name": "title", "value": "Libellé", "language": "fr_CA"}],
+    })
+    e = assert_error(r, "a form-member title in an undeclared locale must be refused")
+    assert_error_quality(e, names=["fr_CA"], suggests=["en"],
+                         ctx="the form-member path must give the same actionable error")
+    assert_no_diff("a rejected localized write must not change the project")
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_modify_accepts_a_locale_the_same_batch_declares():
+    # One batch may set a Language's languageCode AND a localized value under that very code. The
+    # undeclared-locale guard must not reject the second half of an edit whose first half declares
+    # the code - the whole batch is validated before anything is written (issue #298, review).
+    assert_ok(call("create_metadata", {"projectName": PROJECT, "fqn": "Language.Z298Atomic"}),
+              "add the language object")
+    wait_for_project_ready()
+
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Language.Z298Atomic",
+        "properties": [
+            {"name": "languageCode", "value": "fr"},
+            {"name": "synonym", "value": "Francais", "language": "fr"},
+        ],
+    })
+    assert_ok(r, "declare a language code and use it in the SAME call")
+    applied = r.structured.get("applied") or []
+    assert "languageCode" in applied and "synonym" in applied,         "both properties must be applied: %r" % (r.structured,)
+    assert r.structured.get("language") == "fr",         "the result must echo the just-declared locale: %r" % (r.structured,)
+    # The code this very batch declares is judged by the SAME rule as any other: the configuration
+    # is not named in it, so the write is flagged for the agent to ask about rather than refused.
+    assert r.structured.get("localeUnusedInConfiguration") is True,         "a write under the just-declared, unused locale must be flagged: %r" % (r.structured,)
+    wait_for_project_ready()
+
+    # A code that NOBODY declares - neither the model nor this batch - is still refused.
+    bad = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Language.Z298Atomic",
+        "properties": [
+            {"name": "languageCode", "value": "fr"},
+            {"name": "synonym", "value": "Deutsch", "language": "de"},
+        ],
+    })
+    e = assert_error(bad, "a code neither declared nor pending must still be refused")
+    assert_error_quality(e, names=["de"], suggests=["fr"],
+                         ctx="the pending code must be listed among the available ones")
+    wait_for_project_ready()
+
+    # And the mirror case: a batch that RENAMES this language's code must not accept the code it
+    # removes - after it, nothing declares 'fr' any more, so a value written under it is invisible.
+    removed = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": "Language.Z298Atomic",
+        "properties": [
+            {"name": "languageCode", "value": "it"},
+            {"name": "synonym", "value": "Francais", "language": "fr"},
+        ],
+    })
+    e2 = assert_error(removed, "the code the batch removes must be refused")
+    assert_error_quality(e2, names=["fr"], suggests=["it"],
+                         ctx="the error must name the removed code and list the post-batch ones")

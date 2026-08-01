@@ -7,8 +7,11 @@
 package com.ditrix.edt.mcp.server.tools.impl;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import org.eclipse.core.resources.IProject;
@@ -42,6 +45,7 @@ import com._1c.g5.v8.dt.metadata.mdclass.Configuration;
 import com._1c.g5.v8.dt.metadata.mdclass.Document;
 import com._1c.g5.v8.dt.metadata.mdclass.EventSubscription;
 import com._1c.g5.v8.dt.metadata.mdclass.ExchangePlan;
+import com._1c.g5.v8.dt.metadata.mdclass.Language;
 import com._1c.g5.v8.dt.metadata.mdclass.MdClassPackage;
 import com._1c.g5.v8.dt.metadata.mdclass.MdObject;
 import com._1c.g5.v8.dt.metadata.mdclass.Report;
@@ -115,6 +119,18 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
 
     /** Output result key: whether the change was exported to disk. */
     private static final String KEY_PERSISTED = "persisted"; //$NON-NLS-1$
+
+    /** Echoes the locale a localized property was actually written under (#298). */
+    private static final String KEY_LANGUAGE = "language"; //$NON-NLS-1$
+
+    /** Locales IN USE that still have no value for a localized property just written (#298). */
+    private static final String KEY_LOCALES_MISSING = "localesMissing"; //$NON-NLS-1$
+
+    /** Set when a write targets a declared language the configuration's own synonym does not use. */
+    private static final String KEY_LOCALE_UNUSED = "localeUnusedInConfiguration"; //$NON-NLS-1$
+
+    /** Locales whose EXISTING text this call did not touch - they now describe the old value. */
+    private static final String KEY_LOCALES_STALE = "localesStale"; //$NON-NLS-1$
 
     /** Output value for {@link McpKeys#ACTION}: the node was modified. */
     private static final String VAL_MODIFIED = "modified"; //$NON-NLS-1$
@@ -361,6 +377,31 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
             .stringArrayProperty(KEY_APPLIED, "Names of the properties that were set (for a Role " //$NON-NLS-1$
                 + "rights change this is instead an object {rights, templates, roleProperties} with " //$NON-NLS-1$
                 + "the applied counts)") //$NON-NLS-1$
+            .stringProperty(KEY_LANGUAGE, "Language code a localized property was written under; " //$NON-NLS-1$
+                + "present only when this call wrote localized properties under exactly ONE code") //$NON-NLS-1$
+            .stringArrayProperty(KEY_LOCALES_MISSING,
+                "Language codes the configuration USES - the ones its OWN synonym is filled in for - " //$NON-NLS-1$
+                + "that still have NO value for at least one of the localized properties just " //$NON-NLS-1$
+                + "written (empty when every such language is translated); present only when a " //$NON-NLS-1$
+                + "localized property was written. A declared language the configuration itself does " //$NON-NLS-1$
+                + "not use is NOT reported: a multilingual configuration worked on in a " //$NON-NLS-1$
+                + "single-language branch must not nag about the others") //$NON-NLS-1$
+            .stringArrayProperty(KEY_LOCALES_STALE,
+                "Language codes whose value this call did NOT write while it REPLACED the text of " //$NON-NLS-1$
+                + "the same property in another language - they still carry the PREVIOUS text, so " //$NON-NLS-1$
+                + "they now describe the old state (rename the synonym in 'en' and the 'fr' one " //$NON-NLS-1$
+                + "keeps the old name). Reported for every DECLARED language that carries text - " //$NON-NLS-1$
+                + "unlike 'localesMissing', which asks whether the configuration USES the language, " //$NON-NLS-1$
+                + "because text that already exists is not work being demanded of anyone: it is " //$NON-NLS-1$
+                + "there, and this call just made it wrong. Decided per PROPERTY, so a language " //$NON-NLS-1$
+                + "written into that same property by this call is not listed. Absent when there " //$NON-NLS-1$
+                + "are none") //$NON-NLS-1$
+            .booleanProperty(KEY_LOCALE_UNUSED,
+                "Set when a value was written under a language the configuration itself does not " //$NON-NLS-1$
+                + "use (its own synonym has no text for that language). NOT an error - the language " //$NON-NLS-1$
+                + "IS declared, so the value will display - but a prompt to ASK the user whether " //$NON-NLS-1$
+                + "translating into it is really wanted: it may be a single-language build, or a " //$NON-NLS-1$
+                + "language this configuration does not support yet") //$NON-NLS-1$
             .objectProperty(KEY_CONTENT, "For a membership-list content change: the counts object. A " //$NON-NLS-1$
                 + "CommonAttribute / ExchangePlan change reports {added, updated, removed} (members " //$NON-NLS-1$
                 + "attached / had their per-entry flag - 'use' / 'autoRecord' - updated / detached); a " //$NON-NLS-1$
@@ -1185,7 +1226,251 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         {
             return mixError;
         }
-        return modifyDcsContent(ctx, normFqn, (Report)target, args.dcsSpec);
+        // A dcs payload writes localized titles ({code: text}) straight into the DCS model, without
+        // going through the property pipeline where the undeclared-locale guard lives - so without
+        // this the very hole issue #298 closes stayed open on this route. Checked HERE, before any
+        // write, so a bad code fails the call with nothing applied.
+        Set<String> titleLocales = new LinkedHashSet<>();
+        String localeError = dcsTitleLocaleError(ctx.config, args.dcsSpec, titleLocales);
+        if (localeError != null)
+        {
+            return localeError;
+        }
+        // A dcs title is a localized write like any other, so the same question applies: is the
+        // configuration even translated into that language? The report's per-property missing list
+        // has no meaning here (a payload writes many titles at once), but the prompt to ASK does.
+        boolean localeUnused = titleLocales.stream()
+            .anyMatch(code -> MetadataLanguageUtils.isDeclaredButUnused(ctx.config, code));
+        return modifyDcsContent(ctx, normFqn, (Report)target, args.dcsSpec, localeUnused);
+    }
+
+
+    /**
+     * Rejects a localized {@code title} in a {@code dcs} payload whose language code the
+     * configuration does not declare - the same rule the property pipeline applies, on the route
+     * that bypasses it. Issue #298.
+     *
+     * <p>Walks the payload for every {@code title} that is an OBJECT (a {@code {code: text}} map); a
+     * plain-string title is language-neutral and needs no check. Returns a ready JSON error naming
+     * the offending code and the declared ones, or {@code null} when every code is fine (or the
+     * configuration declares none, which leaves nothing to validate against).
+     *
+     * @param config the configuration
+     * @param dcsSpec the raw dcs payload
+     * @param used collects the canonical codes the payload's titles write under
+     * @return a JSON error, or {@code null} when the payload's locales are acceptable
+     */
+    private static String dcsTitleLocaleError(Configuration config, JsonObject dcsSpec,
+        Set<String> used)
+    {
+        if (dcsSpec == null)
+        {
+            return null;
+        }
+        List<String> declared = MetadataLanguageUtils.declaredLanguageCodes(config);
+        if (declared.isEmpty())
+        {
+            // No declared code makes EVERY code undeclared, so a localized title here would be
+            // stored where nothing can display it. The property pipeline refuses this case; the
+            // dcs route must not be the hole it slips through. A payload with no localized title
+            // is untouched - only an actual {code: text} map is refused.
+            String firstLocale = firstDcsTitleLocale(dcsSpec);
+            if (firstLocale == null)
+            {
+                return null;
+            }
+            return ToolResult.error("This configuration declares no language codes, so '" //$NON-NLS-1$ //$NON-NLS-2$
+                + firstLocale + "' in a dcs title cannot be stored where anything would display " //$NON-NLS-1$
+                + "it. Add a Language object with a 'languageCode' first (create_metadata " //$NON-NLS-1$
+                + "'Language.<Name>' + modify_metadata 'languageCode'), then write the title.") //$NON-NLS-1$
+                    .toJson();
+        }
+        return normalizeDcsTitleLocales(config, declared, dcsSpec, used);
+    }
+
+    /**
+     * The first language code any STORED dcs title is keyed by, or {@code null} when the payload
+     * carries no localized title at all. Used only to name a value in the no-declared-language
+     * refusal - the walk itself is {@link #normalizeDcsTitleLocales}.
+     */
+    private static String firstDcsTitleLocale(JsonObject dcsSpec)
+    {
+        for (String member : new String[] {KEY_DCS_PARAMETERS, KEY_DCS_CALCULATED_FIELDS})
+        {
+            String code = firstTitleLocaleOfEntries(dcsSpec.get(member));
+            if (code != null)
+            {
+                return code;
+            }
+        }
+        JsonElement dataSets = dcsSpec.get(DCS_DATA_SETS);
+        if (dataSets == null || !dataSets.isJsonArray())
+        {
+            return null;
+        }
+        for (JsonElement dataSet : dataSets.getAsJsonArray())
+        {
+            if (dataSet != null && dataSet.isJsonObject())
+            {
+                String code = firstTitleLocaleOfEntries(dataSet.getAsJsonObject().get(KEY_DCS_FIELDS));
+                if (code != null)
+                {
+                    return code;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** The first language key of the first object-valued {@code title} in one array of entries. */
+    private static String firstTitleLocaleOfEntries(JsonElement entries)
+    {
+        if (entries == null || !entries.isJsonArray())
+        {
+            return null;
+        }
+        for (JsonElement entry : entries.getAsJsonArray())
+        {
+            if (entry == null || !entry.isJsonObject())
+            {
+                continue;
+            }
+            JsonElement title = entry.getAsJsonObject().get(KEY_DCS_TITLE);
+            if (title != null && title.isJsonObject() && !title.getAsJsonObject().keySet().isEmpty())
+            {
+                return title.getAsJsonObject().keySet().iterator().next();
+            }
+        }
+        return null;
+    }
+
+    /** The dcs payload members the writer reads a storable {@code title} from (see DcsWriter). */
+    private static final String DCS_DATA_SETS = "dataSets"; //$NON-NLS-1$
+
+    private static final String KEY_DCS_FIELDS = "fields"; //$NON-NLS-1$
+
+    private static final String KEY_DCS_PARAMETERS = "parameters"; //$NON-NLS-1$
+
+    private static final String KEY_DCS_CALCULATED_FIELDS = "calculatedFields"; //$NON-NLS-1$
+
+    private static final String KEY_DCS_TITLE = "title"; //$NON-NLS-1$
+
+    /**
+     * Validates and CANONICALIZES the language keys of every {@code title} the DCS writer actually
+     * stores, rejecting a code the configuration does not declare.
+     * <p>
+     * The rewrite matters as much as the rejection: the DCS writer stores the payload's key verbatim,
+     * so accepting {@code EN} against a configuration that declares {@code en_CA} - which the
+     * case-insensitive match does - would store a second, never-displayed key. That is the same
+     * canonicalization the property pipeline performs; the two paths must not disagree.
+     * <p>
+     * The walk follows the writer's OWN shape - a dataset's {@code fields}, the schema
+     * {@code parameters} and the {@code calculatedFields}, mirroring DcsWriter's three
+     * {@code parseTitle} call sites - rather than hunting for any member named {@code title}. A title
+     * the writer never reads (on a data SOURCE, or nested in a member it ignores) reaches no model
+     * object: rejecting its code would fail a call over a value that was never going to be stored,
+     * and counting it would raise a question about a translation that never happened.
+     *
+     * @param used collects the canonical codes the stored titles write under
+     * @return a ready JSON error for the first undeclared code, or {@code null} when all are fine
+     */
+    private static String normalizeDcsTitleLocales(Configuration config, List<String> declared,
+        JsonObject dcsSpec, Set<String> used)
+    {
+        String error = normalizeEntryTitles(config, declared, dcsSpec.get(KEY_DCS_PARAMETERS), used);
+        if (error != null)
+        {
+            return error;
+        }
+        error = normalizeEntryTitles(config, declared, dcsSpec.get(KEY_DCS_CALCULATED_FIELDS), used);
+        if (error != null)
+        {
+            return error;
+        }
+        JsonElement dataSets = dcsSpec.get(DCS_DATA_SETS);
+        if (dataSets == null || !dataSets.isJsonArray())
+        {
+            return null;
+        }
+        for (JsonElement dataSet : dataSets.getAsJsonArray())
+        {
+            if (dataSet == null || !dataSet.isJsonObject())
+            {
+                continue;
+            }
+            error = normalizeEntryTitles(config, declared,
+                dataSet.getAsJsonObject().get(KEY_DCS_FIELDS), used);
+            if (error != null)
+            {
+                return error;
+            }
+        }
+        return null;
+    }
+
+    /** Validates the object-valued {@code title} of every entry in one array of writer entries. */
+    private static String normalizeEntryTitles(Configuration config, List<String> declared,
+        JsonElement entries, Set<String> used)
+    {
+        if (entries == null || !entries.isJsonArray())
+        {
+            return null;
+        }
+        for (JsonElement entry : entries.getAsJsonArray())
+        {
+            if (entry == null || !entry.isJsonObject())
+            {
+                continue;
+            }
+            JsonElement title = entry.getAsJsonObject().get(KEY_DCS_TITLE);
+            if (title == null || !title.isJsonObject())
+            {
+                // A plain-string title is language-neutral, and anything else is the writer's own
+                // error to report - this guard only judges LANGUAGE keys.
+                continue;
+            }
+            String error = canonicalizeTitleKeys(config, declared, title.getAsJsonObject(), used);
+            if (error != null)
+            {
+                return error;
+            }
+        }
+        return null;
+    }
+
+    /** Validates and canonicalizes the keys of ONE {@code {code: text}} title object, in place. */
+    private static String canonicalizeTitleKeys(Configuration config, List<String> declared,
+        JsonObject title, Set<String> used)
+    {
+        java.util.Map<String, JsonElement> rewritten = new java.util.LinkedHashMap<>();
+        for (java.util.Map.Entry<String, JsonElement> entry : title.entrySet())
+        {
+            String code = entry.getKey();
+            String canonical = MetadataLanguageUtils.canonicalLanguageCode(config, code);
+            if (canonical == null)
+            {
+                return ToolResult.error("Unknown language '" + code + "' for a dcs title. This " //$NON-NLS-1$ //$NON-NLS-2$
+                    + "configuration declares: " + String.join(", ", declared) //$NON-NLS-1$ //$NON-NLS-2$
+                    + ". A value stored under an undeclared code is never displayed.").toJson(); //$NON-NLS-1$
+            }
+            if (rewritten.containsKey(canonical))
+            {
+                // Two spellings of one declared code, e.g. {"en": ..., "EN": ...}. Canonicalizing
+                // would silently drop one translation - and which one survived would depend on map
+                // order. Say so instead: only the caller knows which text was meant.
+                return ToolResult.error("A dcs title names the language '" + canonical //$NON-NLS-1$
+                    + "' twice (as '" + code + "' and again in another spelling). Give it once.") //$NON-NLS-1$
+                        .toJson();
+            }
+            rewritten.put(canonical, entry.getValue());
+            used.add(canonical);
+        }
+        for (String key : new ArrayList<>(title.keySet()))
+        {
+            title.remove(key);
+        }
+        rewritten.forEach(title::add);
+        return null;
     }
 
     /**
@@ -1845,7 +2130,8 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
      * {@link #dcsMixError} / {@link #dcsOnlyForReportFqnError}), so this method is entered only for a Report
      * FQN with a lone {@code dcs} payload.</p>
      */
-    private String modifyDcsContent(ProjectContext ctx, String normFqn, Report report, JsonObject dcsSpec)
+    private String modifyDcsContent(ProjectContext ctx, String normFqn, Report report, // NOSONAR signature is inherent / public-or-test-contract; a parameter-object would not improve clarity
+        JsonObject dcsSpec, boolean localeUnused)
     {
         // The Report is a top BM object - capture its bmGetId up front, re-fetch inside the tx (a top
         // object's eContainer() does not reliably climb).
@@ -1896,7 +2182,7 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         }
         boolean persisted =
             !exportFqns.isEmpty() && BmTransactions.forceExportToDisk(ctx.project, exportFqns);
-        return buildDcsResult(normFqn, result, persisted);
+        return buildDcsResult(normFqn, result, persisted, localeUnused);
     }
 
     /**
@@ -2113,7 +2399,8 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
      * ({@code dataSources} / {@code dataSets} / {@code fields} / {@code parameters}) plus {@code persisted}
      * and a confirmation message. Pure helper.
      */
-    private static String buildDcsResult(String normFqn, DcsWriter.Result result, boolean persisted)
+    private static String buildDcsResult(String normFqn, DcsWriter.Result result, boolean persisted,
+        boolean localeUnused)
     {
         JsonObject applied = new JsonObject();
         applied.addProperty("dataSources", result.dataSources); //$NON-NLS-1$
@@ -2121,11 +2408,16 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         applied.addProperty("fields", result.fields); //$NON-NLS-1$
         applied.addProperty("parameters", result.parameters); //$NON-NLS-1$
         applied.addProperty("calculatedFields", result.calculatedFields); //$NON-NLS-1$
-        return ToolResult.success()
+        ToolResult dcsResult = ToolResult.success()
             .put(McpKeys.ACTION, VAL_MODIFIED)
             .put("fqn", normFqn) //$NON-NLS-1$
             .put(KEY_DCS, applied)
-            .put(KEY_PERSISTED, persisted)
+            .put(KEY_PERSISTED, persisted);
+        if (localeUnused)
+        {
+            dcsResult.put(KEY_LOCALE_UNUSED, true);
+        }
+        return dcsResult
             .put(McpKeys.MESSAGE, "Modified DCS of report " + normFqn + " (dataSources: " //$NON-NLS-1$ //$NON-NLS-2$
                 + result.dataSources + ", dataSets: " + result.dataSets + ", fields: " + result.fields //$NON-NLS-1$ //$NON-NLS-2$
                 + ", parameters: " + result.parameters + ", calculatedFields: " //$NON-NLS-1$ //$NON-NLS-2$
@@ -2354,6 +2646,12 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         final long configBmId =
             xdtoNamespaceChange && config instanceof IBmObject ? ((IBmObject)config).bmGetId() : -1L;
         final String[] contentFqnHolder = { null };
+        // Read OUTSIDE the write transaction (a plain configuration read, like the language
+        // resolution the prepare step already did); only the per-object present locales are
+        // collected inside. Issue #298.
+        final List<String> declaredCodes = MetadataLanguageUtils.declaredOrOverride(config,
+            declaredCodesAfterBatch(config, target, properties));
+        final LocalizedWriteReport localizedReport = new LocalizedWriteReport();
         final List<String> cascadedPackageNames = new ArrayList<>();
         final List<String> cascadedExportFqns = new ArrayList<>();
 
@@ -2366,10 +2664,12 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
                 // namespace change - null otherwise, so the cascade below never fires).
                 final String oldNamespace = (xdtoNamespaceChange && applyTo instanceof XDTOPackage)
                     ? ((XDTOPackage)applyTo).getNamespace() : null;
+                localizedReport.rememberPreState(applyTo, changes);
                 for (PreparedChange change : changes)
                 {
                     change.applyTo(applyTo, tx);
                 }
+                localizedReport.collect(applyTo, changes, declaredCodes, config);
                 if (fqnGenerator != null && applyTo instanceof XDTOPackage)
                 {
                     XDTOPackage changedPkg = (XDTOPackage)applyTo;
@@ -2441,7 +2741,8 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         }
         boolean persisted = BmTransactions.forceExportToDisk(ctx.project, exportFqns);
 
-        return buildModifiedResult(normFqn, applied, persisted, normReport, cascadedPackageNames);
+        return buildModifiedResult(normFqn, applied, persisted, normReport, cascadedPackageNames,
+            localizedReport);
     }
 
     /**
@@ -2716,11 +3017,27 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
     private static String buildModifiedResult(String normFqn, List<String> applied, boolean persisted,
         MdNameNormalizer.Report normReport, List<String> cascadedPackageNames)
     {
+        return buildModifiedResult(normFqn, applied, persisted, normReport, cascadedPackageNames, null);
+    }
+
+    /**
+     * The {@link #buildModifiedResult(String, List, boolean, MdNameNormalizer.Report, List)} variant
+     * that also reports the localized write: the locale actually used and the declared locales that
+     * still have no translation. Issue #298.
+     */
+    private static String buildModifiedResult(String normFqn, List<String> applied, boolean persisted, // NOSONAR signature is inherent / public-or-test-contract; a parameter-object would not improve clarity
+        MdNameNormalizer.Report normReport, List<String> cascadedPackageNames,
+        LocalizedWriteReport localizedReport)
+    {
         ToolResult result = ToolResult.success()
             .put(McpKeys.ACTION, VAL_MODIFIED)
             .put("fqn", normFqn) //$NON-NLS-1$
             .put(KEY_APPLIED, applied)
             .put(KEY_PERSISTED, persisted);
+        if (localizedReport != null)
+        {
+            localizedReport.addTo(result);
+        }
         normReport.addTo(result);
         String message = MSG_MODIFIED_PREFIX + normFqn + " (" + String.join(", ", applied) + ")"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         if (!cascadedPackageNames.isEmpty())
@@ -3164,7 +3481,8 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         List<JsonObject> properties, List<PreparedChange> changes, MdNameNormalizer.Report normReport,
         boolean isExtensionProject)
     {
-        PrepareContext ctx = new PrepareContext(project, config, version);
+        PrepareContext ctx = new PrepareContext(project, config, version,
+            declaredCodesAfterBatch(config, target, properties));
         for (JsonObject prop : properties)
         {
             // The mdclass path has no <extInfo> (extInfo == null): findFeature then classifies only the
@@ -3275,6 +3593,10 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         final Version version = v8Project != null ? v8Project.getVersion() : null;
 
         final List<String> applied = new ArrayList<>();
+        // A form member's title is a localized property too, so it gets the same report the mdclass
+        // path gives (issue #298). The declared codes are read OUTSIDE the write transaction.
+        final List<String> declaredCodes = MetadataLanguageUtils.declaredLanguageCodes(config);
+        final LocalizedWriteReport localizedReport = new LocalizedWriteReport();
 
         // Validate + apply inside ONE BM write transaction: resolve the member, validate every
         // property (a failure throws FormValidationException carrying the JSON error BEFORE any eSet,
@@ -3301,6 +3623,11 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
                     }
                     List<HolderChange> changes =
                         prepareFormMemberChanges(config, version, member, properties, normReport);
+                    // (receiver, change) of every localized write, reported only AFTER the whole
+                    // batch is applied: reading a map mid-batch would report a locale as missing that
+                    // a LATER change in the same call fills in.
+                    List<EObject> localizedHolders = new ArrayList<>();
+                    List<PreparedChange> localizedChanges = new ArrayList<>();
                     for (HolderChange hc : changes)
                     {
                         // A direct feature lands on the member; a property on the nested <extInfo> lands
@@ -3308,8 +3635,23 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
                         // validated. Mixing both in one call routes each change to its correct receiver.
                         EObject holder = hc.onExtInfo
                             ? FormElementWriter.ensureExtInfo(formModel, member) : member;
+                        // BEFORE the write: whether this locale already held text decides if the
+                        // OTHER locales go stale (see LocalizedWriteReport.rememberPreState).
+                        localizedReport.rememberPreState(holder, List.of(hc.change));
                         hc.change.applyTo(holder, tx);
                         applied.add(hc.change.featureName());
+                        if (hc.change.isLocalized())
+                        {
+                            // Remember the receiver the change actually landed on: a title on the
+                            // member and one on its <extInfo> live in different objects.
+                            localizedHolders.add(holder);
+                            localizedChanges.add(hc.change);
+                        }
+                    }
+                    for (int i = 0; i < localizedChanges.size(); i++)
+                    {
+                        localizedReport.collect(localizedHolders.get(i),
+                            List.of(localizedChanges.get(i)), declaredCodes, config);
                     }
                 });
         }
@@ -3331,6 +3673,7 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
             .put("fqn", normFqn) //$NON-NLS-1$
             .put(KEY_APPLIED, applied)
             .put(KEY_PERSISTED, persisted);
+        localizedReport.addTo(result);
         normReport.addTo(result);
         return result
             .put(McpKeys.MESSAGE, MSG_MODIFIED_PREFIX + normFqn + " (" + String.join(", ", applied) + ")") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
@@ -4249,12 +4592,114 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
 
         final Version version;
 
+        /** Codes declared AFTER this batch; {@code null} when it changes no language code. */
+        final List<String> declaredAfterBatch;
+
         PrepareContext(IProject project, Configuration config, Version version)
+        {
+            this(project, config, version, null);
+        }
+
+        PrepareContext(IProject project, Configuration config, Version version,
+            List<String> declaredAfterBatch)
         {
             this.project = project;
             this.config = config;
             this.version = version;
+            this.declaredAfterBatch = declaredAfterBatch;
         }
+    }
+
+    /**
+     * The language codes the configuration will declare AFTER this batch is applied, or {@code null}
+     * when the batch changes no language code (the caller then uses the model's current set).
+     * Issue #298.
+     *
+     * <p>The set is the configuration's languages with the TARGET language's code REPLACED by the
+     * one this batch assigns - not the union of old and new. A batch that renames a code
+     * ({@code en} -&gt; {@code fr}) leaves no {@code en} behind, so a value written under {@code en}
+     * in that same batch would be invisible and must be refused, exactly like any other undeclared
+     * code. A batch that gives a NEW language its first code adds it, because the target's old code
+     * is empty.
+     *
+     * <p>Safe by construction: the whole batch is prepared before anything is written, so if the
+     * {@code languageCode} entry is itself rejected the call fails and nothing is applied.
+     *
+     * @param config the configuration
+     * @param target the object being modified
+     * @param properties the raw properties array (may be {@code null})
+     * @return the post-batch codes, or {@code null} when this batch changes no language code
+     */
+    private static List<String> declaredCodesAfterBatch(Configuration config, MdObject target,
+        List<JsonObject> properties)
+    {
+        if (config == null || !(target instanceof Language) || properties == null)
+        {
+            return null;
+        }
+        String newCode = null;
+        for (JsonObject prop : properties)
+        {
+            if ("languageCode".equalsIgnoreCase(asString(prop.get("name")))) //$NON-NLS-1$ //$NON-NLS-2$
+            {
+                String value = asString(prop.get(KEY_VALUE));
+                if (value != null && !value.isEmpty())
+                {
+                    newCode = value;
+                }
+            }
+        }
+        if (newCode == null)
+        {
+            return null;
+        }
+        List<String> codes = new ArrayList<>();
+        boolean targetSeen = false;
+        String defaultAfter = null;
+        Language defaultLanguage = config.getDefaultLanguage();
+        for (Language lang : config.getLanguages())
+        {
+            if (lang == null)
+            {
+                continue;
+            }
+            boolean isTarget = lang == target || lang.getName() != null
+                && lang.getName().equals(((Language)target).getName());
+            targetSeen |= isTarget;
+            String code = isTarget ? newCode : lang.getLanguageCode();
+            if (isDefaultLanguage(defaultLanguage, lang))
+            {
+                defaultAfter = code;
+            }
+            if (code != null && !code.isEmpty() && !codes.contains(code))
+            {
+                codes.add(code);
+            }
+        }
+        if (!targetSeen && !codes.contains(newCode))
+        {
+            codes.add(newCode);
+        }
+        // The DEFAULT language's post-edit code goes FIRST: it is what a localized value with no
+        // explicit 'language' must fall back to once the batch has renamed the old default code
+        // away. Counting what is left cannot answer that - a second, untouched language leaves two
+        // codes and neither of them is "the default" by position alone.
+        if (defaultAfter != null && !defaultAfter.isEmpty() && codes.remove(defaultAfter))
+        {
+            codes.add(0, defaultAfter);
+        }
+        return codes;
+    }
+
+    /** Whether {@code lang} IS the configuration's default language (by identity, else by name). */
+    private static boolean isDefaultLanguage(Language defaultLanguage, Language lang)
+    {
+        if (defaultLanguage == null || lang == null)
+        {
+            return false;
+        }
+        return defaultLanguage == lang
+            || defaultLanguage.getName() != null && defaultLanguage.getName().equals(lang.getName());
     }
 
     private String prepare(PrepareContext ctx, EObject target, EObject extInfo,
@@ -4315,7 +4760,7 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         switch (info.valueKind)
         {
             case LOCALIZED_STRING:
-                return prepareLocalized(ctx.config, name, value, prop, info, out, normReport);
+                return prepareLocalized(ctx, name, value, prop, info, out, normReport);
             case ENUM:
                 return prepareEnum(name, value, info, out);
             case BOOLEAN:
@@ -4469,7 +4914,7 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
      * success, appends the prepared localized change to {@code out}. Returns a JSON error on failure,
      * or {@code null} on success. Read-only: it only builds and queues the change (no model mutation).
      */
-    private String prepareLocalized(Configuration config, String name, String value, JsonObject prop,
+    private String prepareLocalized(PrepareContext ctx, String name, String value, JsonObject prop,
         PropertyInfo info, List<PreparedChange> out, MdNameNormalizer.Report normReport)
     {
         if (value == null || value.isEmpty())
@@ -4479,8 +4924,11 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
         String code;
         try
         {
-            code = MetadataLanguageUtils.resolveSynonymLanguage(config, value,
-                asString(prop.get("language")), "'" + name + "'"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            // Validate against what the configuration will declare AFTER this batch: an edit that
+            // sets a Language's 'languageCode' and a localized value under it must not reject its own
+            // second half, and one that RENAMES a code must not accept the code it removes.
+            code = MetadataLanguageUtils.resolveSynonymLanguage(ctx.config, value,
+                asString(prop.get("language")), "'" + name + "'", ctx.declaredAfterBatch); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         }
         catch (IllegalArgumentException e)
         {
@@ -4885,6 +5333,22 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
             return typeChange;
         }
 
+        boolean isLocalized()
+        {
+            return kind == Kind.LOCALIZED;
+        }
+
+        EStructuralFeature feature()
+        {
+            return feature;
+        }
+
+        /** The locale a {@code LOCALIZED} change was written under; {@code null} for other kinds. */
+        String language()
+        {
+            return localizedLanguage;
+        }
+
         @SuppressWarnings("unchecked")
         void applyTo(EObject target, IBmTransaction tx)
         {
@@ -5014,5 +5478,231 @@ public class ModifyMetadataTool extends AbstractMetadataWriteTool
     {
         String[] parts = normFqn.split("\\."); //$NON-NLS-1$
         return parts.length >= 2 ? parts[0] + "." + parts[1] : normFqn; //$NON-NLS-1$
+    }
+
+    /**
+     * Collects what a modify wrote to LOCALIZED properties, so the result can tell the caller which
+     * locale was actually used and which declared locales still owe a translation. Issue #298.
+     *
+     * <p>A locale counts as MISSING when the configuration USES it (its own synonym is filled in
+     * for it) and AT LEAST ONE of the localized properties written by this call has no value for it -
+     * the caller is told there is work left, without having to re-read the object. The present locales are read from the model right after the changes are applied, so an
+     * object that already carried other translations is reported correctly (unlike a create, where
+     * the map is necessarily fresh).
+     */
+    private static final class LocalizedWriteReport
+    {
+        private final Set<String> languagesUsed = new LinkedHashSet<>();
+        private final Set<String> missing = new LinkedHashSet<>();
+        /** Per PROPERTY (one receiver's one feature): the locales this call left holding old text. */
+        private final Map<String, Set<String>> staleByProperty = new LinkedHashMap<>();
+        /** Per PROPERTY: the locales this call actually wrote - the ones that are NOT left behind. */
+        private final Map<String, Set<String>> writtenByProperty = new LinkedHashMap<>();
+        /** (receiver, feature, language) -> the text that was there BEFORE this call touched it. */
+        private final Map<String, String> textBefore = new LinkedHashMap<>();
+        /** (receiver, feature, language) -> the text the LAST change in this call writes there. */
+        private final Map<String, String> textAfter = new LinkedHashMap<>();
+        private boolean wrote;
+        private boolean unusedLocale;
+
+        /**
+         * Records which of the localized changes will OVERWRITE existing text. Call INSIDE the write
+         * transaction, BEFORE the changes are applied.
+         * <p>
+         * The distinction decides whether the OTHER languages went stale. Overwriting the 'en' text
+         * of a property leaves the 'fr' one describing the previous value - that is the case worth
+         * reporting. FILLING IN a previously missing 'fr' does not touch 'en' at all: the English
+         * text is as current as it was, and calling it stale would be an invented warning.
+         *
+         * @param target the object the changes are about to be applied to
+         * @param changes the prepared changes
+         */
+        @SuppressWarnings("unchecked")
+        void rememberPreState(EObject target, List<PreparedChange> changes)
+        {
+            for (PreparedChange change : changes)
+            {
+                if (!change.isLocalized())
+                {
+                    continue;
+                }
+                Object map = target.eGet(change.feature());
+                if (!(map instanceof EMap))
+                {
+                    continue;
+                }
+                String had = ((EMap<String, String>)map).map().get(change.language());
+                String key = preStateKey(target, change);
+                // The FIRST pre-state seen for a key is the real "before": a batch may write the
+                // same property and language more than once, and the later writes see what the
+                // earlier ones left, not what the call started from.
+                textBefore.putIfAbsent(key, had == null ? "" : had); //$NON-NLS-1$
+                // The LAST write is what the model ends up with, and only the end state can make
+                // another language out of date. Writing 'New' and then putting 'Old' back leaves
+                // the property exactly as it was, so nothing behind it went stale.
+                textAfter.put(key, change.localizedValue == null ? "" : change.localizedValue); //$NON-NLS-1$
+            }
+        }
+
+        /**
+         * Identity of one (receiver, feature, language) triple.
+         * <p>
+         * The receiver is part of it because a form call writes the same feature name on DIFFERENT
+         * objects (a title on the member and one on its extInfo, or on two different items), and the
+         * language because that is what a single change writes.
+         */
+        private static String preStateKey(EObject target, PreparedChange change)
+        {
+            return propertyKey(target, change) + "/" + change.language(); //$NON-NLS-1$
+        }
+
+        /**
+         * Whether this call left that (receiver, feature, language) holding DIFFERENT text than it
+         * found there. Empty before means there was nothing to make out of date; equal before and
+         * after means the value never moved, however many writes passed through it.
+         */
+        private boolean replaced(String key)
+        {
+            String before = textBefore.get(key);
+            return before != null && !before.isEmpty() && !before.equals(textAfter.get(key));
+        }
+
+        /** Identity of one PROPERTY - one receiver's one feature; staleness is decided per property. */
+        private static String propertyKey(EObject target, PreparedChange change)
+        {
+            return System.identityHashCode(target) + "#" + change.feature().getName(); //$NON-NLS-1$
+        }
+
+        /**
+         * Reads the localized maps of the just-applied changes. Call INSIDE the write transaction,
+         * AFTER the changes are applied.
+         */
+        @SuppressWarnings("unchecked")
+        void collect(EObject target, List<PreparedChange> changes, List<String> declaredCodes,
+            Configuration config)
+        {
+            // Only the languages the configuration ACTUALLY uses are owed a translation; a declared
+            // one it never fills in is a language nobody is translating into (see localesInUse).
+            // The question is asked about declaredCodes - the AFTER-batch set this call reports on -
+            // so a code this very batch declares is judged by the same rule as any other.
+            List<String> inUse = MetadataLanguageUtils.localesInUse(config, declaredCodes);
+            for (PreparedChange change : changes)
+            {
+                if (!change.isLocalized())
+                {
+                    continue;
+                }
+                wrote = true;
+                languagesUsed.add(change.language());
+                writtenByProperty.computeIfAbsent(propertyKey(target, change), k -> new LinkedHashSet<>())
+                    .add(change.language());
+                unusedLocale |= declaredCodes.contains(change.language())
+                    && !inUse.contains(change.language());
+                Object map = target.eGet(change.feature());
+                if (!(map instanceof EMap))
+                {
+                    continue;
+                }
+                Map<String, String> present = ((EMap<String, String>)map).map();
+                // MISSING and STALE ask different questions, so they read different sets. Owing a
+                // NEW translation is what the in-use rule is about: a language the configuration
+                // itself is not named in is one nobody is translating into, and nagging about it
+                // is what the rule forbids. Text that is ALREADY THERE is not owed - it exists,
+                // and this call just made it describe the old value - so staleness is asked about
+                // every DECLARED language: whoever wrote that text is translating into it,
+                // whatever the configuration's own synonym says.
+                for (String declared : declaredCodes)
+                {
+                    String value = present.get(declared);
+                    if (value == null || value.isEmpty())
+                    {
+                        if (inUse.contains(declared))
+                        {
+                            missing.add(declared);
+                        }
+                    }
+                    else if (!declared.equals(change.language()) && replaced(preStateKey(target, change)))
+                    {
+                        // It HAS text, this call did not write it, and the language it DID write
+                        // already had text of its own: the value CHANGED, so the others now say
+                        // what the object used to be called. Invisible to a "missing" list - the
+                        // value is there, it is just the OLD one. (Had this call merely filled in a
+                        // language that was empty, nothing would have gone stale - see
+                        // rememberPreState.)
+                        staleByProperty.computeIfAbsent(propertyKey(target, change),
+                            k -> new LinkedHashSet<>()).add(declared);
+                    }
+                }
+            }
+        }
+
+        /**
+         * Appends the report to a result: the locale used (only when this call used exactly ONE -
+         * see {@link #singleLanguage()}) and the declared locales still without a translation. A
+         * no-op when no localized property was written, so the ABSENCE of both fields is what tells
+         * a caller nothing localized was touched.
+         */
+        void addTo(ToolResult result)
+        {
+            if (!wrote)
+            {
+                return;
+            }
+            String only = singleLanguage();
+            if (only != null)
+            {
+                result.put(KEY_LANGUAGE, only);
+            }
+            result.put(KEY_LOCALES_MISSING, missing());
+            List<String> stillOld = staleLocales();
+            if (!stillOld.isEmpty())
+            {
+                result.put(KEY_LOCALES_STALE, stillOld);
+            }
+            if (unusedLocale)
+            {
+                // Legal, but worth a question: the configuration's own synonym has no text for that
+                // language, so this may be a single-language build or one that does not support it
+                // yet. The caller's agent should ask rather than quietly populate it.
+                result.put(KEY_LOCALE_UNUSED, true);
+            }
+        }
+
+        /**
+         * The locales that CARRY TEXT this call did not rewrite - the old wording of a property
+         * whose other language just changed.
+         * <p>
+         * Decided PER PROPERTY. A call that changes {@code title} in en and {@code toolTip} in fr
+         * leaves title.fr and toolTip.en behind: excluding every language the call touched anywhere
+         * would hide both. Only the property's OWN written locales are excluded, so translating en
+         * and fr of the SAME property in one call still leaves neither of them behind.
+         *
+         * @return the codes, deduplicated across properties, never {@code null}
+         */
+        List<String> staleLocales()
+        {
+            Set<String> out = new LinkedHashSet<>();
+            for (Map.Entry<String, Set<String>> entry : staleByProperty.entrySet())
+            {
+                Set<String> left = new LinkedHashSet<>(entry.getValue());
+                left.removeAll(writtenByProperty.getOrDefault(entry.getKey(), Set.of()));
+                out.addAll(left);
+            }
+            return new ArrayList<>(out);
+        }
+
+        /**
+         * The single locale every localized property was written under, or {@code null} when this
+         * call used more than one (echoing one of them would misdescribe the others).
+         */
+        String singleLanguage()
+        {
+            return languagesUsed.size() == 1 ? languagesUsed.iterator().next() : null;
+        }
+
+        List<String> missing()
+        {
+            return new ArrayList<>(missing);
+        }
     }
 }
