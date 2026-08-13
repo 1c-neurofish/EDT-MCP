@@ -519,6 +519,157 @@ def test_preview_for_catalog_does_not_mutate_catalog():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# What disableIndices ACTUALLY did (issue #394)
+#
+# The executed report used to print the SIZE OF THE REQUEST as `disabledCount`, so
+# "I asked to skip 1" and "1 was skipped" were the same sentence — and the tool said
+# it just as loudly when nothing had been skipped at all. It matters because the caller
+# is an agent deciding whether a change was left behind on purpose.
+#
+# The report now states the REAL number, and every requested ENTRY that produced no skip comes
+# back: an index that matched nothing under `unknownIndices`, one naming a point the refactoring
+# requires under `notSkippableIndices`, one naming a point this tool cannot switch off under
+# `unsupportedIndices`, and entries that never parsed as indices COUNTED under `unparsedCount`.
+#
+# CommonModule.CascadeEn is the target because its change set is tiny and fully known:
+# exactly two points, `#0` the bslRef in CascadeUser (Skippable: yes) and `#1` the
+# rename itself (Skippable: no).
+# ──────────────────────────────────────────────────────────────────────────────
+
+@e2e_test(tool="rename_metadata_object", kind="write-metadata")
+def test_unknown_disable_index_is_not_counted_as_a_skip():
+    _settle_before_rename()  # executes a real rename - see the helper
+    # #99 does not exist (the target has 2 change points). Before #394 this printed
+    # "disabledCount: 1" and "1 change point(s) were skipped as requested" while the
+    # cascade applied in full — the report contradicted the disk.
+    r = call("rename_metadata_object", {
+        "projectName": PROJECT,
+        "objectFqn": "CommonModule.CascadeEn",
+        "newName": "Reckoner",
+        "confirm": True,
+        "disableIndices": "99",
+    })
+    assert_ok(r, "execute rename with an out-of-range disableIndices")
+    assert_contains(r.text, "action: executed", "the rename must still execute")
+    assert_contains(r.text, "disabledCount: 0",
+                    "nothing was skipped, so disabledCount must be 0 — not the size of the request")
+    assert_not_contains(r.text, "were skipped as requested",
+                        "the report must not claim a skip when no change point was switched off")
+    assert_contains(r.text, "unknownIndices: [99]",
+                    "an index that matched no change point must be reported, not swallowed")
+
+    # The report's claim is checked against the DISK: the cascade really did apply.
+    src = call("read_module_source", {"projectName": PROJECT,
+                                      "modulePath": "CommonModules/CascadeUser/Module.bsl"})
+    assert_ok(src, "read CascadeUser after a rename with an unknown disableIndices")
+    assert_contains(src.text, "Reckoner.Marker()",
+                    "the change point was NOT skipped, so the caller must have been rewritten")
+
+
+@e2e_test(tool="rename_metadata_object", kind="write-metadata")
+def test_required_disable_index_is_reported_as_applied_not_skipped():
+    # The second way a requested index produces no skip (issue #393): it names a change
+    # point the refactoring deems mandatory. The preview prints `Skippable: no` for it and
+    # the guide promises "required ones are always applied" — so the correct outcome is that
+    # nothing is skipped, and the report has to SAY so rather than echo the request.
+    #
+    # SCOPE, stated so this test is not mistaken for more than it is: on this fixture the only
+    # `Skippable: no` row is the core rename itself, which arrives as a PLAIN (non-native)
+    # refactoring item. So what this pins is the ACCOUNTING for a required index — the
+    # native-item guard from #393 has no live reproduction here (every native item on
+    # TestConfiguration reports isOptional()==true) and is constrained headlessly instead, by
+    # MetadataRenameDisableIndicesTest.testRequiredNativeItemKeepsItsLeavesEnabled.
+    _settle_before_rename()  # executes a real rename - see the helper
+    # Establish from the PREVIEW which index is the required one rather than hard-coding it:
+    # the assertion is about the contract, and reading the number from the same table the
+    # caller reads is what makes this a test of that contract.
+    preview = call("rename_metadata_object", {
+        "projectName": PROJECT,
+        "objectFqn": "CommonModule.CascadeEn",
+        "newName": "Reckoner",
+        "confirm": False,
+    })
+    assert_ok(preview, "preview rename CommonModule.CascadeEn")
+    # | # | Type | Description | Line | Col | Default | Skippable | Project | FQN |
+    required = []
+    for line in preview.text.splitlines():
+        cells = split_markdown_row(line)
+        if len(cells) >= 7 and cells[0].isdigit() and cells[6] == "no":
+            required.append(cells[0])
+    if not required:
+        raise AssertionError(
+            "fixture precondition: the preview of CommonModule.CascadeEn must contain at least one "
+            "`Skippable: no` change point (the rename leaf itself); got:\n" + preview.text)
+
+    index = required[0]
+    r = call("rename_metadata_object", {
+        "projectName": PROJECT,
+        "objectFqn": "CommonModule.CascadeEn",
+        "newName": "Reckoner",
+        "confirm": True,
+        "disableIndices": index,
+    })
+    assert_ok(r, "execute rename asking to skip a REQUIRED change point")
+    assert_contains(r.text, "action: executed", "the rename must still execute")
+    assert_contains(r.text, "disabledCount: 0",
+                    "a required change point cannot be skipped, so nothing was disabled")
+    assert_not_contains(r.text, "were skipped as requested",
+                        "the report must not claim a skip that the contract forbids")
+    assert_contains(r.text, "notSkippableIndices: [%s]" % index,
+                    "the requested-but-required index must be named in the report")
+    assert_contains(r.text, "could NOT be skipped and were left in the rename",
+                    "the report must say plainly that the change point stayed in the rename")
+    assert_contains(r.text, "errors: 0",
+                    "the rename itself must have succeeded, or the claim above is about nothing")
+
+    # The report's claim checked against the model: the required point really did go through.
+    after = _commonmodule_names(name_filter="Reckoner")
+    assert_contains(after, "| Reckoner ",
+                    "the required rename point was not skipped, so the new name must exist")
+
+
+@e2e_test(tool="rename_metadata_object", kind="write-metadata")
+def test_unparsable_disable_index_token_is_reported_not_swallowed():
+    _settle_before_rename()  # executes a real rename - see the helper
+    # The third way a requested entry produces no skip: it never became an index at all. The parse
+    # used to drop non-numeric tokens on the spot, so this exact call — disableIndices made ONLY of
+    # junk — answered byte for byte as if the argument had not been passed: the caller asked for a
+    # skip, got none, and nothing anywhere said so.
+    #
+    # Junk-ONLY on purpose, not "0,abc": with a valid index alongside it, the execute walk runs and
+    # the outcome gets built along the way, so a regression that carried tokens only when some index
+    # parsed would still pass. Here there is no index at all, which is what pins the report being
+    # assembled for a request the walk never had anything to do.
+    r = call("rename_metadata_object", {
+        "projectName": PROJECT,
+        "objectFqn": "CommonModule.CascadeEn",
+        "newName": "Reckoner",
+        "confirm": True,
+        "disableIndices": "abc",
+    })
+    assert_ok(r, "execute rename with a disableIndices made only of a non-numeric token")
+    assert_contains(r.text, "action: executed", "the rename must still execute")
+    assert_contains(r.text, "disabledCount: 0", "nothing was skipped, and nothing could have been")
+    assert_contains(r.text, "unparsedCount: 1",
+                    "an entry that is not a number must be reported, not dropped at the parse")
+    # The CONTENT is deliberately not echoed - see DisableRequest for the nine defects that decided
+    # it. The signal is what the caller needed; the signal is a number.
+    assert_not_contains(r.text, "abc",
+                        "the caller's own text must not come back in the report")
+    assert_contains(r.text, "entr(ies) in disableIndices could not be read as change-point indices",
+                    "the report must explain what happened to it")
+    # It never became an index, so it must not be filed as one.
+    assert_not_contains(r.text, "unknownIndices",
+                        "a non-numeric token is not an unknown INDEX - it never became one")
+    # The rename itself is untouched by the junk: the cascade applied in full.
+    src = call("read_module_source", {"projectName": PROJECT,
+                                      "modulePath": "CommonModules/CascadeUser/Module.bsl"})
+    assert_ok(src, "read CascadeUser after a rename with an unparsable disableIndices")
+    assert_contains(src.text, "Reckoner.Marker()",
+                    "an unparsable disableIndices must not silently suppress the cascade")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # The cascade bound (issue #365)
 #
 # The rename runs on EDT's UI thread; nothing in that hand-off had an upper bound,

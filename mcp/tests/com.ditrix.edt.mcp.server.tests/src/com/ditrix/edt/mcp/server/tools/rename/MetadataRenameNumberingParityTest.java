@@ -242,11 +242,18 @@ public class MetadataRenameNumberingParityTest
 
         int previewedIndexOfC = indexOfRow(rows, "c"); //$NON-NLS-1$
         int[] executeCounter = {0};
+        Set<Integer> requested = Set.of(Integer.valueOf(previewedIndexOfC));
+        // The execute walk also classifies what each requested index did (#394), so it needs the
+        // outcome accumulator. Built reflectively like every other seam here, off the same parsed
+        // request the tool would hand in; what this test cares about is still only the NUMBERING,
+        // which the accumulator does not participate in.
+        Object outcome = onlyConstructor(nested("DisableOutcome")) //$NON-NLS-1$
+            .newInstance(DisableRequest.parse(String.valueOf(previewedIndexOfC)));
         Method applyDisableToItem = method("applyDisableToItem"); //$NON-NLS-1$
         for (IRefactoringItem item : items)
         {
-            applyDisableToItem.invoke(new MetadataRenameService(), item,
-                Set.of(Integer.valueOf(previewedIndexOfC)), executeCounter);
+            applyDisableToItem.invoke(new MetadataRenameService(), item, requested, executeCounter,
+                outcome);
         }
 
         assertFalse("the leaf the caller saw under that #index must be the one disabled", //$NON-NLS-1$
