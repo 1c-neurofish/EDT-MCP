@@ -356,6 +356,101 @@ Add to `.claude.json` (in Windows `%USERPROFILE%\.claude.json`):
 
 </details>
 
+## 1C:Workmate in-process bridge
+
+When 1C:Workmate (`com.e1c.edt.ai*` 1.0.5) runs in the same EDT JVM, integration
+works in both directions:
+
+- `ask_workmate` starts Workmate's full conversation/tool loop in a bounded
+  background job and returns a pollable `jobId`, so the MCP transport request
+  does not stay open for the full cloud round-trip. The Workmate bundles remain
+  optional and are loaded only at runtime through OSGi/reflection; they are not
+  part of this project's target platform. **The tool ships disabled** — it sends
+  the question to an external cloud service and Workmate may change the
+  configuration with its own tools — so enable it under
+  *Preferences → EDT MCP Server → Tools* first.
+- The OSGi service `com.ditrix.edt.mcp.server.bridge.IEdtMcpBridge` lets
+  Workmate/JShell list and call EDT-MCP tools without importing EDT-MCP packages.
+  `callTool` goes through the same dispatcher as MCP `tools/call` and returns its
+  JSON-RPC response.
+
+Two details decide whether this actually works, both measured against Workmate
+1.0.5:
+
+- **The skill.** `ConversationFacade` defaults to `raw`, under which the cloud
+  answers from the model alone — one assistant message, no tool call, no look at
+  the project. `ask_workmate` therefore sends `custom` (the skill Workmate's own
+  autopilot uses), which runs the full tool loop. Override with `skillName` only
+  if you know the name is accepted; the cloud refuses most others outright.
+- **The question carries the bridge.** Workmate's chat reads a project's
+  `.workmate` rules, but this Java path does not, so `ask_workmate` prefixes the
+  question with the bridge instructions and the list of tool NAMES (full
+  descriptions stay behind `get_tool_guide`, which it calls when it needs one).
+  Pass `shareMcpTools=false` to send the question verbatim instead.
+
+The same instance is published under the JDK types `BiFunction<String,String,String>`
+(`callTool`) and `Supplier<String>` (`listTools`), both carrying the service property
+`edt.mcp.bridge=v1`. Prefer that alias: it needs no reflection and no access to the
+bridge package, which matters for callers whose rules forbid unproven Java API - such
+as Workmate's JShell tool.
+
+```java
+// Take the context from an ALWAYS-ACTIVE bundle, not from EDT-MCP's own: this bundle
+// uses lazy activation, so `Platform.getBundle("com.ditrix.edt.mcp.server")
+// .getBundleContext()` can hand back null and the next line then fails with
+// "because ctx is null". OSGi services are global, so any live context finds this one.
+var bundleContext = org.osgi.framework.FrameworkUtil
+    .getBundle(org.eclipse.core.runtime.Platform.class).getBundleContext();
+var references = bundleContext.getServiceReferences(
+    java.util.function.BiFunction.class, "(edt.mcp.bridge=v1)");
+if (references.isEmpty()) {
+    throw new IllegalStateException("EDT-MCP bridge service is not registered");
+}
+var mcp = bundleContext.getService(references.iterator().next());
+System.out.println(mcp.apply("get_edt_version", "{}"));
+```
+
+A consumer that prefers the named contract can still resolve it by string name and
+invoke it reflectively:
+
+```java
+var serviceReference = bundleContext.getServiceReference(
+    "com.ditrix.edt.mcp.server.bridge.IEdtMcpBridge");
+var bridgeService = bundleContext.getService(serviceReference);
+try {
+    var callTool = bridgeService.getClass().getMethod(
+        "callTool", String.class, String.class);
+    System.out.println((String) callTool.invoke(
+        bridgeService, "get_edt_version", "{}"));
+} finally {
+    bundleContext.ungetService(serviceReference);
+}
+```
+
+### Letting Workmate's chat use the bridge
+
+Workmate's agentic chat holds its `JShell` tool but **not** `JShellSession`, and
+`JShell` rejects every call whose `repl_session_id` it cannot resolve. The chat can
+therefore execute code but cannot obtain the one value executing code requires.
+
+EDT-MCP breaks that deadlock: shortly after startup it registers a JShell session
+under the constant id **`edt-mcp`** (retried in the background while Workmate comes
+up, and again if Workmate ever evicts it). Together with `jshell_edt_canonical_imports`
+— a fixed entry in Workmate's own scenario catalogue — both values JShell demands are
+constants, so a project's rules can name them literally and nothing has to be passed
+around at runtime:
+
+```
+repl_session_id = "edt-mcp"
+manual_ids      = ["jshell_edt_canonical_imports"]
+```
+
+[`tests/TestConfiguration/.workmate/WORKMATE.md`](tests/TestConfiguration/.workmate/WORKMATE.md)
+is a working example of such a rules file; copy it into `<project>/.workmate/` to give
+the chat the same access in your own configuration. Note that the chat cannot reach the
+HTTP endpoint at all — `java.net.URL`, `java.net.Socket` and `ProcessBuilder` are on
+Workmate's restricted-types list — so the in-process bridge is its only route.
+
 ## Multi-EDT Proxy
 
 Running more than one EDT instance at once? [`edt-mcp-proxy`](proxy/) is a standalone router that exposes a single, stable MCP endpoint on `:8764` and forwards each call to the right EDT-MCP instance by `projectName`, discovering live instances in the background. It ships as `edt-mcp-proxy-<version>.jar` alongside the plugin archive in every [release](https://github.com/DitriXNew/EDT-MCP/releases). See [proxy/README.md](proxy/README.md) for setup, CLI options and configuration.
@@ -370,7 +465,7 @@ with `python docs/generate_tool_docs.py`.
 <!-- TOOLS-INDEX:START -->
 <!-- generated by docs/generate_tool_docs.py — do not edit by hand -->
 
-**86 tools**, grouped by toolset. Full per-tool pages under [docs/tools/](docs/tools/).
+**87 tools**, grouped by toolset. Full per-tool pages under [docs/tools/](docs/tools/).
 
 ### Core
 
@@ -449,10 +544,11 @@ with `python docs/generate_tool_docs.py`.
 
 ### Testing
 
-> YAXUnit unit testing: run and debug test suites.
+> YAXUnit unit testing and 1C:Workmate assistance.
 
 | Tool | Description |
 |------|-------------|
+| [`ask_workmate`](docs/tools/ask_workmate.md) | Start or poll a background question to the 1C:Workmate plugin without holding an MCP request open for the full cloud conversation. Requires a compatible Work… *(not enabled by default)* |
 | [`debug_yaxunit_tests`](docs/tools/debug_yaxunit_tests.md) | Deprecated alias for run_yaxunit_tests with debug=true. Launches YAXUnit tests in DEBUG mode so breakpoints fire, then call wait_for_break to inspect. Prefer… |
 | [`run_yaxunit_tests`](docs/tools/run_yaxunit_tests.md) | Run YAXUnit tests for a 1C:Enterprise project and return a JUnit Markdown report. The whole call is bounded by `timeout` (default and maximum 45s, larger val… |
 
