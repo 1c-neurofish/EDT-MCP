@@ -2110,9 +2110,12 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Trace which BSL methods call a method or are called by it. Parameters and examples: get_tool_guide('get_method_call_hierarchy').",
+    "description": "Trace which BSL methods call a method or are called by it; optional depth walks the chain transitively for impact analysis (callers only, max 5). Finds STATIC invocations only, so a complete result does not prove nothing else calls the method. Parameters and examples: get_tool_guide('get_method_call_hierarchy').",
     "inputSchema": {
       "properties": {
+        "depth": {
+          "type": "integer"
+        },
         "direction": {
           "description": "'callers' = who calls this method, 'callees' = what it calls, 'outgoing' = aggregated distinct call targets (module-wide when methodName is omitted).",
           "enum": [
