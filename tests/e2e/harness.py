@@ -761,9 +761,52 @@ def wait_for_server(timeout=60):
     raise RuntimeError("MCP server not reachable at %s" % HEALTH_URL)
 
 
+def _all_edt_projects_ready(list_projects_markdown):
+    """True when every EDT project in the list_projects table reads 'ready'.
+
+    Only rows KNOWN to be non-EDT (`EDT Project` = No) are skipped; "-" (a closed project, or one
+    whose natures could not be read) keeps blocking, because a real project that is genuinely
+    building must never be mistaken for one that cannot become ready.
+
+    A workspace that hosts a 1C STANDALONE SERVER
+    contains the WST container project ("Servers", `EDT Project` = No, no natures), which is
+    permanently 'not_available' because it is not an EDT project at all and can never become
+    ready. A plain substring scan for 'not_available' over the whole table therefore never
+    succeeds on such a workspace: the suite waited out the full timeout and aborted with "the
+    configuration did not finish indexing" while every real project had been ready all along.
+
+    Falls back to the substring scan when no row can be parsed (an output-format change must
+    degrade to the old behaviour, not to a permanent "ready").
+    """
+    rows = []
+    for line in list_projects_markdown.splitlines():
+        line = line.strip()
+        if not line.startswith("|") or set(line) <= set("|- "):
+            continue  # separator row (or an empty one)
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 5 or cells[0].lower() == "name":
+            continue  # header row, or a table shape this parse does not know
+        rows.append(cells)
+    if not rows:
+        low = list_projects_markdown.lower()
+        return "building" not in low and "not_available" not in low
+    for cells in rows:
+        state, edt_project = cells[1].strip().lower(), cells[4].strip().lower()
+        if edt_project == "no":
+            continue  # a KNOWN non-EDT project (the standalone server's "Servers" container)
+        # Anything else - "-" for a closed project, or one whose natures could not be read - still
+        # blocks: treating unknown as non-EDT would let a real project that is genuinely building
+        # be ignored, and the suite would start mutating the model during a reload.
+        if state in ("building", "not_available"):
+            return False
+    return True
+
+
 def wait_for_project_ready(timeout=None):
-    """Wait until every project is fully indexed (state 'ready') — i.e. none is still
-    'building' its derived data AND none is 'not_available' (mid (re)load).
+    """Wait until every EDT project is fully indexed (state 'ready') — i.e. none is still
+    'building' its derived data AND none is 'not_available' (mid (re)load). Non-EDT projects
+    are ignored (see _all_edt_projects_ready): a standalone server's "Servers" container is
+    permanently 'not_available' and would otherwise block every run on such a workspace.
 
     After a `-clean` relaunch the MCP port opens (wait_for_server) BEFORE EDT finishes
     indexing, so a cascade/mutation tool (rename / delete / create) run too early would
@@ -797,8 +840,8 @@ def wait_for_project_ready(timeout=None):
     last_log = start
     while time.time() < deadline:
         try:
-            text = (call("list_projects", {}).text or "").lower()
-            if text and "building" not in text and "not_available" not in text:
+            text = call("list_projects", {}).text or ""
+            if text and _all_edt_projects_ready(text):
                 return True
         except E2ECallTimeout:
             # The one failure a best-effort catch must NOT swallow: the server is still running

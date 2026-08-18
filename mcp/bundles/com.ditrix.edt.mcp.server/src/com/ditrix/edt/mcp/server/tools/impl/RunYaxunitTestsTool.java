@@ -55,6 +55,7 @@ import com.ditrix.edt.mcp.server.utils.BackgroundJobs;
 import com.ditrix.edt.mcp.server.utils.BackgroundJobs.JobSnapshot;
 import com.ditrix.edt.mcp.server.utils.BackgroundJobs.ProgressReporter;
 import com.ditrix.edt.mcp.server.utils.DebugSessionRegistry;
+import com.ditrix.edt.mcp.server.utils.DebugServerTargetSupport;
 import com.ditrix.edt.mcp.server.utils.ExternalInfobaseChangesPolicy;
 import com.ditrix.edt.mcp.server.utils.InfobaseAuthDialogSuppressor;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
@@ -62,8 +63,11 @@ import com.ditrix.edt.mcp.server.utils.LaunchUpdateDialogAutoConfirmer;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils.PrepInFlight;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils.PreLaunchResult;
 import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
+import com.ditrix.edt.mcp.server.utils.McpJobs;
 import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
+import com.ditrix.edt.mcp.server.utils.StandaloneServerPortConflictPolicy;
+import com.ditrix.edt.mcp.server.utils.StandaloneServerStateRecovery;
 import com.ditrix.edt.mcp.server.utils.YaxunitJobCancellation;
 import com.ditrix.edt.mcp.server.utils.YaxunitReportUtils;
 import com.e1c.g5.dt.applications.ApplicationException;
@@ -242,6 +246,8 @@ public class RunYaxunitTestsTool implements IMcpTool
             .stringProperty("updateScope", UPDATE_SCOPE_DESCRIPTION) //$NON-NLS-1$
             .stringProperty("externalInfobaseChanges", //$NON-NLS-1$
                 EXTERNAL_INFOBASE_CHANGES_DESCRIPTION) //$NON-NLS-1$
+            .stringProperty("standaloneServerPortConflict", //$NON-NLS-1$
+                StandaloneServerPortConflictPolicy.PARAMETER_DESCRIPTION)
             .booleanProperty("debug", //$NON-NLS-1$
                 "true launches in DEBUG mode so breakpoints fire: a short start returns the "  //$NON-NLS-1$
                     + "launch handle and you call wait_for_break next, while Pending returns a "  //$NON-NLS-1$
@@ -308,9 +314,10 @@ public class RunYaxunitTestsTool implements IMcpTool
     }
 
     /**
-     * The actionable message for a launch window whose external-changes dialog was cancelled, or
-     * {@code null} when nothing was cancelled (or no window was opened because the caller armed no
-     * policy).
+     * The actionable message for a launch window in which this plugin auto-answered a blocking
+     * modal that stopped the run — a standalone-server port conflict (the server never started) or
+     * a cancelled external-changes dialog — or {@code null} when neither happened (or no window
+     * was opened because the caller armed no policy).
      *
      * <p>This is the standalone-server case: {@code prepareForFreshLaunch} defers that
      * application's DB update to EDT's launch delegate, so the launch window is the only place the
@@ -326,7 +333,23 @@ public class RunYaxunitTestsTool implements IMcpTool
     private static String declinedConflict(LaunchUpdateDialogAutoConfirmer.ConflictWatch conflicts,
         ExternalInfobaseChangesPolicy policy)
     {
-        if (conflicts == null || !conflicts.cancelled())
+        if (conflicts == null)
+        {
+            return null;
+        }
+        // The same launch window is where a standalone-server START fails on a busy port: that
+        // modal is auto-cancelled (it would hang the run), and EDT then reports only a bare
+        // cancellation. Checked first - it is the earlier cause, and nothing about the caller's
+        // data was declined.
+        if (conflicts.portConflicted())
+        {
+            return LaunchUpdateDialogAutoConfirmer.portConflictError(conflicts.portConflictDetail(),
+                conflicts.portConflictReason());
+        }
+        // The external-changes branch is consulted ONLY when this call armed that matcher: the
+        // window is now opened for the port matcher as well, and an unattributed cancel from a
+        // concurrent operation must not be reported as this run's declined update.
+        if (policy == null || !conflicts.cancelled())
         {
             return null;
         }
@@ -465,6 +488,16 @@ public class RunYaxunitTestsTool implements IMcpTool
             return ToolResult.error("Unknown externalInfobaseChanges value: '" + rawPolicy //$NON-NLS-1$
                 + "'. Accepted values: " + ExternalInfobaseChangesPolicy.acceptedValues()).toJson(); //$NON-NLS-1$
         }
+        String rawPortPolicy =
+            JsonUtils.extractStringArgument(params, "standaloneServerPortConflict"); //$NON-NLS-1$
+        StandaloneServerPortConflictPolicy portConflict =
+            StandaloneServerPortConflictPolicy.parse(rawPortPolicy);
+        if (portConflict == null)
+        {
+            return ToolResult.error("Unknown standaloneServerPortConflict value: '" + rawPortPolicy //$NON-NLS-1$
+                + "'. Accepted values: " //$NON-NLS-1$
+                + StandaloneServerPortConflictPolicy.acceptedValues()).toJson();
+        }
         boolean debug = JsonUtils.extractBooleanArgument(params, "debug", false); //$NON-NLS-1$ //$NON-NLS-2$
 
         boolean hasName = configName != null && !configName.isEmpty();
@@ -485,7 +518,8 @@ public class RunYaxunitTestsTool implements IMcpTool
         purgeTerminatedLaunches();
 
         RunRequest request = new RunRequest(configName, projectName, applicationId, extensions,
-            modules, tests, tags, timeout, updateBeforeLaunch, updateScope, externalChanges, debug);
+            modules, tests, tags, timeout, updateBeforeLaunch, updateScope, externalChanges,
+            portConflict, debug);
         return startOrAttach(request, owningTool);
     }
 
@@ -812,11 +846,14 @@ public class RunYaxunitTestsTool implements IMcpTool
         final boolean updateBeforeLaunch;
         final String updateScope;
         final ExternalInfobaseChangesPolicy externalChanges;
+        /** How EDT's standalone-server port-conflict modal is answered for this run. */
+        final StandaloneServerPortConflictPolicy portConflict;
         final boolean debug;
 
         RunRequest(String configName, String projectName, String applicationId, String extensions, // NOSONAR signature is inherent / public-or-test-contract; a parameter-object would not improve clarity
                 String modules, String tests, String tags, int timeout, boolean updateBeforeLaunch,
-                String updateScope, ExternalInfobaseChangesPolicy externalChanges, boolean debug)
+                String updateScope, ExternalInfobaseChangesPolicy externalChanges,
+                StandaloneServerPortConflictPolicy portConflict, boolean debug)
         {
             this.configName = configName;
             this.projectName = projectName;
@@ -829,6 +866,7 @@ public class RunYaxunitTestsTool implements IMcpTool
             this.updateBeforeLaunch = updateBeforeLaunch;
             this.updateScope = updateScope;
             this.externalChanges = externalChanges;
+            this.portConflict = portConflict;
             this.debug = debug;
         }
     }
@@ -1099,15 +1137,26 @@ public class RunYaxunitTestsTool implements IMcpTool
         // Armed even without a resolved name: the confirmer degrades such an arm to 'cancel', so
         // the modal is answered (no hang) but nothing is written on an unattributable dialog.
         ExternalInfobaseChangesPolicy launchPolicy = armFlags[0] ? req.externalChanges : null;
+        // The port matcher is armed only for a STANDALONE-SERVER target: a file or client-server
+        // application cannot raise that modal, and an arm held for the whole run would claim a
+        // dialog belonging to a concurrent (or manual) server start.
+        StandaloneServerPortConflictPolicy launchPortPolicy =
+            DebugServerTargetSupport.isServerApplicationId(applicationId)
+                ? req.portConflict : null;
         // For a STANDALONE-SERVER application this window is where the DB update actually
         // happens, so a conflict cancelled here must be reported with its cause - otherwise the run
         // just fails later with a generic "no junit.xml" and the caller never learns which knob
         // would have let it through.
-        LaunchUpdateDialogAutoConfirmer.ConflictWatch conflicts = launchPolicy == null
-            ? null
-            : LaunchUpdateDialogAutoConfirmer.beginConflictWatch(launchInfobase);
+        // Opened whenever EITHER matcher is armed. Gating it on launchPolicy alone lost the
+        // port-conflict reason exactly when updateBeforeLaunch=false: the matcher is armed (it must
+        // be, or the run hangs), the conflict is refused, and the run then failed with a generic
+        // "no report" instead of the busy ports.
+        LaunchUpdateDialogAutoConfirmer.ConflictWatch conflicts =
+            launchPolicy == null && launchPortPolicy == null
+                ? null
+                : LaunchUpdateDialogAutoConfirmer.beginConflictWatch(launchInfobase);
         LaunchUpdateDialogAutoConfirmer.arm(armFlags[0], armFlags[1], armFlags[0], launchPolicy,
-            launchInfobase);
+            launchInfobase, launchPortPolicy);
         ILaunch launch;
         try
         {
@@ -1118,8 +1167,8 @@ public class RunYaxunitTestsTool implements IMcpTool
                 throw new CoreException(new Status(IStatus.CANCEL, Activator.PLUGIN_ID,
                     "The YAXUnit job was cancelled before the launch was handed to EDT.")); //$NON-NLS-1$
             }
-            launch = workingCopy.launch(ILaunchManager.RUN_MODE,
-                new NullProgressMonitor());
+            launch = StandaloneServerStateRecovery.launchWithRecovery(workingCopy,
+                ILaunchManager.RUN_MODE, new NullProgressMonitor());
         }
         catch (CoreException ex)
         {
@@ -1136,7 +1185,7 @@ public class RunYaxunitTestsTool implements IMcpTool
         finally
         {
             LaunchUpdateDialogAutoConfirmer.disarm(armFlags[0], armFlags[1], armFlags[0], launchPolicy,
-                launchInfobase);
+                launchInfobase, launchPortPolicy);
             // Closed HERE, not after the check below: a launch() that throws must not leave the
             // window registered in the confirmer for the rest of the session.
             closeQuietly(conflicts);
@@ -1549,13 +1598,22 @@ public class RunYaxunitTestsTool implements IMcpTool
             String launchInfobase = LaunchLifecycleUtils.attributionInfobaseName(appManager, project,
                 applicationId);
             ExternalInfobaseChangesPolicy launchPolicy = armFlags[0] ? req.externalChanges : null;
+            // The port matcher is armed only for a STANDALONE-SERVER target: a file or client-server
+            // application cannot raise that modal, and an arm held for the whole run would claim a
+            // dialog belonging to a concurrent (or manual) server start.
+            StandaloneServerPortConflictPolicy launchPortPolicy =
+                DebugServerTargetSupport.isServerApplicationId(applicationId)
+                    ? req.portConflict : null;
             // Same as the RUN path: this is the only armed window around a standalone-server
             // application's delegate-performed update, so a cancel here is reported with its cause.
-            LaunchUpdateDialogAutoConfirmer.ConflictWatch conflicts = launchPolicy == null
-                ? null
-                : LaunchUpdateDialogAutoConfirmer.beginConflictWatch(launchInfobase);
+            // Same as the RUN path: the window covers the port matcher too, which is armed even
+            // when this launch performs no DB update.
+            LaunchUpdateDialogAutoConfirmer.ConflictWatch conflicts =
+                launchPolicy == null && launchPortPolicy == null
+                    ? null
+                    : LaunchUpdateDialogAutoConfirmer.beginConflictWatch(launchInfobase);
             LaunchUpdateDialogAutoConfirmer.arm(armFlags[0], armFlags[1], armFlags[0], launchPolicy,
-                launchInfobase);
+                launchInfobase, launchPortPolicy);
             ILaunch[] spawned = new ILaunch[1];
             try
             {
@@ -1569,7 +1627,8 @@ public class RunYaxunitTestsTool implements IMcpTool
                         + "launch was handed to EDT. Start it again if it is still needed.") //$NON-NLS-1$
                         .toJson();
                 }
-                spawned[0] = workingCopy.launch(ILaunchManager.DEBUG_MODE, new NullProgressMonitor());
+                spawned[0] = StandaloneServerStateRecovery.launchWithRecovery(workingCopy,
+                    ILaunchManager.DEBUG_MODE, new NullProgressMonitor());
             }
             catch (CoreException ex)
             {
@@ -1583,7 +1642,7 @@ public class RunYaxunitTestsTool implements IMcpTool
             finally
             {
                 LaunchUpdateDialogAutoConfirmer.disarm(armFlags[0], armFlags[1], armFlags[0],
-                    launchPolicy, launchInfobase);
+                    launchPolicy, launchInfobase, launchPortPolicy);
                 closeQuietly(conflicts);
             }
             String declined = declinedConflict(conflicts, launchPolicy);
@@ -1870,7 +1929,7 @@ public class RunYaxunitTestsTool implements IMcpTool
         prepJob.setPriority(Job.INTERACTIVE);
         try
         {
-            prepJob.schedule();
+            McpJobs.schedule(prepJob);
         }
         finally
         {
@@ -2310,7 +2369,8 @@ public class RunYaxunitTestsTool implements IMcpTool
         return configName + ":" //$NON-NLS-1$
             + sha1(framed(projectName, applicationId, filterKeyPart(req.extensions),
                 filterKeyPart(req.modules), filterKeyPart(req.tests), filterKeyPart(req.tags),
-                req.externalChanges.wireValue(), preLaunchKeyPart(req)));
+                req.externalChanges.wireValue(), portConflictKeyPart(req),
+                preLaunchKeyPart(req)));
     }
 
     /**
@@ -2324,7 +2384,26 @@ public class RunYaxunitTestsTool implements IMcpTool
             + sha1(framed(req.configName, req.projectName, req.applicationId,
                 filterKeyPart(req.extensions), filterKeyPart(req.modules),
                 filterKeyPart(req.tests), filterKeyPart(req.tags),
-                req.externalChanges.wireValue(), preLaunchKeyPart(req)));
+                req.externalChanges.wireValue(), portConflictKeyPart(req),
+                preLaunchKeyPart(req)));
+    }
+
+    /**
+     * The port-conflict term of both keys: how this request answers EDT's standalone-server
+     * port-conflict modal.
+     *
+     * <p>Keyed for the same reason {@code externalChanges} is: it is a decision the CALLER made
+     * about what may happen to their stand, and the two answers are not interchangeable — one
+     * refuses, the other lets EDT rewrite the server configuration. Attaching a caller who asked
+     * for "reassign" to a run started under "cancel" would silently drop their choice and hand
+     * back a report produced under a decision they did not make.
+     *
+     * <p>Null-tolerant: a request built without a policy reads as the default.
+     */
+    private static String portConflictKeyPart(RunRequest req)
+    {
+        return (req.portConflict == null
+            ? StandaloneServerPortConflictPolicy.DEFAULT : req.portConflict).wireValue();
     }
 
     /**

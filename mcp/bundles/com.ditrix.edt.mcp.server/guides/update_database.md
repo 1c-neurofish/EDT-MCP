@@ -108,3 +108,49 @@ The modal's own default button is **Import**, which would rewrite the project so
 plugin never presses it blind: if the labelled button for the selected policy cannot be found (an
 unshipped locale, a reworded button) the dialog is cancelled and the update reports the failure
 instead of writing anything.
+
+## Standalone server: busy ports
+
+Updating a standalone-server application (`applicationId` starting with `ServerApplication.`)
+STARTS the server first. If one of its configured ports (HTTP gate / debug server / SSH gate) is
+already bound, EDT raises a modal titled **"Standalone server port conflict"** /
+**"Конфликт портов автономного сервера"** offering *Find free port* or *Cancel*. Nobody presses it
+in an unattended run, so the call would block until the client times out.
+
+`standaloneServerPortConflict` answers it for you:
+
+| value | what happens | when to use |
+|---|---|---|
+| `cancel` (default) | the server does not start; the call fails and names the busy ports | you want to know about the conflict and fix it yourself — nothing on the stand is changed |
+| `reassign` | EDT picks free ports, **rewrites the server configuration** and the operation proceeds | you accept that the server changes address (its clients must follow) |
+
+The dialog's DEFAULT button is *Find free port*, so this plugin never presses it blind: with
+`cancel` it presses the labelled *Cancel*, and with `reassign` it presses *Find free port* by its
+label — a build or locale whose button labels are unknown falls back to cancelling rather than
+rewriting the configuration. A `reassign` that was actually applied is reported back:
+`standaloneServerPortsReassigned: true` plus a NOTE in the message.
+
+The usual holder of a busy port is an `ibsrv` process left over from an earlier EDT session — it
+survives EDT being killed. Stopping it (or stopping the server in EDT's *Servers* view) is
+usually preferable to re-addressing the server.
+
+The same parameter exists on `debug_launch` and `run_yaxunit_tests`, which start the server too.
+Where the refusal shows up differs: `debug_launch` is fire-and-forget, so it reports through
+`debug_status` under `recentLaunchFailures`; `run_yaxunit_tests` reports through its own named job -
+in the initial response, or from `get_job_status(jobId)`.
+
+## Standalone server stuck in STARTED (recovered automatically)
+
+EDT starts a standalone server only from the STOPPED state, and it returns the server to STOPPED
+only once it has confirmed that the `ibsrv` process is gone - a confirmation it waits a few seconds
+for. When the process takes longer to disappear, or the wait is interrupted by a cancelled
+operation, EDT keeps the server marked STARTED while the launch that owned it is already dead, and
+refuses every further start with *"Can only start server that is stopped but current server state
+is 2"*. Nothing clears that state by itself: from then on EVERY launch or update of that
+application fails with the same message.
+
+That refusal is now detected and repaired: the server is stopped through EDT's own application
+lifecycle and the operation is retried ONCE. Only the STARTED case is touched - a server that is
+STARTING or STOPPING belongs to an operation still in flight, and is reported ("retry once it
+settles") instead of being stopped underneath it. If the retry fails too, the error says so and
+names the likely reason: an `ibsrv` left over from the previous run still holding the ports.
