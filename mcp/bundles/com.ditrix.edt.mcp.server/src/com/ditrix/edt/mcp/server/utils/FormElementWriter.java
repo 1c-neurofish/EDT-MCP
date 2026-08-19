@@ -1076,7 +1076,26 @@ public final class FormElementWriter
     public static FormEditContext resolveForEdit(IProject project, Configuration config,
         String formPath, String formNotFoundMessage)
     {
-        MdObject mdForm = FormStructureReader.resolveMdForm(config, formPath);
+        return resolveForEdit(project, MetadataScope.ofConfiguration(config), formPath,
+            formNotFoundMessage);
+    }
+
+    /**
+     * The {@link #resolveForEdit(IProject, Configuration, String, String)} variant that resolves the
+     * form against whichever ROOT the project has - so a form of an external data processor /
+     * report is found in its own project rather than looked for in the base configuration
+     * (issue #309).
+     *
+     * @param project the workspace project
+     * @param scope the resolution root of {@code project}
+     * @param formPath the form path to resolve
+     * @param formNotFoundMessage the user-visible message when the form does not resolve
+     * @return the resolved context
+     */
+    public static FormEditContext resolveForEdit(IProject project, MetadataScope scope,
+        String formPath, String formNotFoundMessage)
+    {
+        MdObject mdForm = FormStructureReader.resolveMdForm(scope, formPath);
         if (mdForm == null)
         {
             throw new FormValidationException(ToolResult.error(formNotFoundMessage).toJson());
@@ -1977,7 +1996,15 @@ public final class FormElementWriter
         {
             return null;
         }
-        EObject resolved = resolveType(provider, owner, ownerEnglishType + "Object." + ownerName); //$NON-NLS-1$
+        // A STANDALONE type (external data processor / report) names its object type WITHOUT the
+        // "Object" suffix in the DT model - ExternalDataProcessor.<Name>, not
+        // ExternalDataProcessorObject.<Name>; only the XML (Designer) export renames it. Appending
+        // the suffix there would look up a name the model does not have.
+        MetadataTypeUtils.MetadataTypeInfo ownerInfo =
+            MetadataTypeUtils.resolve(ownerEnglishType);
+        String objectTypeName = ownerInfo != null && ownerInfo.isStandalone()
+            ? ownerEnglishType + "." + ownerName : ownerEnglishType + "Object." + ownerName; //$NON-NLS-1$ //$NON-NLS-2$
+        EObject resolved = resolveType(provider, owner, objectTypeName);
         if (!(resolved instanceof TypeItem))
         {
             // The platform TYPE_ITEM provider only knows PLATFORM type names - createProxy throws
