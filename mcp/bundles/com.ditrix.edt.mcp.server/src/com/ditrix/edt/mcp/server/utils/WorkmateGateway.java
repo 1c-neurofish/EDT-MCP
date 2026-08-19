@@ -21,6 +21,7 @@ import java.util.Collection;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import com.ditrix.edt.mcp.server.bridge.BridgeActivity;
@@ -151,6 +152,12 @@ public class WorkmateGateway
 
     /** How often the wait wakes up to see whether the turn is still doing anything. */
     static final long DEFAULT_IDLE_POLL_MS = 5_000L;
+
+    /**
+     * How often a directly invoked tool's wait re-reads the clock. Short, because its only
+     * job is to keep a descheduled thread from waking up past the deadline it was given.
+     */
+    private static final long TOOL_WAIT_POLL_MS = 1_000L;
 
     /** Mutable only so a test can shrink the window; production never changes them. */
     private static volatile long idleTurnTimeoutMs = DEFAULT_IDLE_TURN_TIMEOUT_MS;
@@ -639,7 +646,7 @@ public class WorkmateGateway
                 // Checked BEFORE the commit handshake, not only inside the send: a request that
                 // has not gone out yet leaves nothing behind, so an expired budget here is an
                 // ordinary retryable timeout rather than the "already dispatched" kind.
-                if (session == null && remainingMillis(deadlineNanos) <= 0)
+                if (session == null && budgetSpent(deadlineNanos))
                 {
                     throw GatewayException.timedOut();
                 }
@@ -683,7 +690,7 @@ public class WorkmateGateway
                     lastAnnouncement = stripped;
                 }
                 if (isAnswer || turn.session == null || continuations >= MAX_CONTINUATIONS
-                    || remainingMillis(deadlineNanos) <= 0)
+                    || budgetSpent(deadlineNanos))
                 {
                     break;
                 }
@@ -1068,8 +1075,7 @@ public class WorkmateGateway
         // Immediately before the send, because dispatching is what has consequences: Workmate's
         // tool loop can change this configuration, and a request let out after the advertised
         // budget spends time the caller was never promised. A later wait-timeout does not undo it.
-        long remainingMillis = remainingMillis(deadlineNanos);
-        if (remainingMillis <= 0)
+        if (budgetSpent(deadlineNanos))
         {
             throw firstTurn ? GatewayException.timedOut() : GatewayException.timedOutAfterDispatch();
         }
@@ -1101,8 +1107,7 @@ public class WorkmateGateway
         // Recomputed AFTER the dispatch returned: sendAsync does synchronous work of its own
         // (it creates the conversation), and waiting on the budget measured before it would add
         // that duration back on top of the absolute deadline, once per turn.
-        long waitMillis = remainingMillis(deadlineNanos);
-        if (waitMillis <= 0)
+        if (budgetSpent(deadlineNanos))
         {
             // The request is already out, so this is never the retryable kind of timeout.
             cancelled.set(true);
@@ -1117,7 +1122,8 @@ public class WorkmateGateway
             // Milliseconds, not floored seconds: rounding down cancelled a turn up to a second
             // before the advertised budget ran out, and a floor of one second let an already
             // spent budget overshoot by one more.
-            sendResult = awaitTurn(future, waitMillis);
+            // The length may round; only "is there still time" must not (budgetSpent above).
+            sendResult = awaitTurn(future, Math.max(1L, remainingMillis(deadlineNanos)));
         }
         catch (TimeoutException e)
         {
@@ -1402,6 +1408,96 @@ public class WorkmateGateway
     }
 
     /**
+     * Waits for a directly invoked Workmate tool, bounded by an ABSOLUTE deadline.
+     *
+     * <p>Every wake re-reads the clock instead of trusting one relative measurement: a thread
+     * descheduled after computing "how long is left" would otherwise begin that full wait
+     * whenever it resumes, and overrun the budget by however long it was away. The token is
+     * marked as soon as the deadline passes, so the tool learns it too.
+     *
+     * @param future the tool's future
+     * @param deadlineNanos when the caller's budget expires
+     * @param cancelled the flag behind the token handed to Workmate
+     * @return the tool's result
+     * @throws TimeoutException when the budget runs out first
+     * @throws InterruptedException if the wait is interrupted
+     * @throws ExecutionException if the tool failed
+     */
+    private static Object awaitToolResult(CompletableFuture<?> future, long deadlineNanos,
+        AtomicBoolean cancelled) throws TimeoutException, InterruptedException, ExecutionException
+    {
+        while (true)
+        {
+            // Expiry is decided in NANOSECONDS: remainingMillis truncates, so a remainder under
+            // one millisecond would read as zero and end the wait before the deadline it was
+            // given - cancelling a tool that was about to finish inside it.
+            if (budgetSpent(deadlineNanos))
+            {
+                // THE rule, and the only one this side can prove: a timeout is a budget that ran
+                // out while the tool had NOT finished. Once the future is terminal its outcome is
+                // handed over as it stands - result or failure alike - because nothing here can
+                // establish whether our cancellation caused it. Review of #444 walked that to the
+                // end: a completion stamp records when a dependent action RAN, never when the
+                // source completed, and the producer side belongs to Workmate.
+                if (future.isDone())
+                {
+                    return future.get();
+                }
+                cancelled.set(true);
+                throw new TimeoutException("the tool's budget ran out"); //$NON-NLS-1$
+            }
+            // ... while the WAIT length may round, as long as it never rounds down to zero (which
+            // would spin) - it only decides how soon the deadline is looked at again.
+            long leftMs = Math.max(1L, remainingMillis(deadlineNanos));
+            try
+            {
+                return future.get(Math.min(leftMs, TOOL_WAIT_POLL_MS), TimeUnit.MILLISECONDS);
+            }
+            catch (TimeoutException stillRunning)
+            {
+                // Deliberately swallowed: only the absolute deadline above ends this wait.
+                continue;
+            }
+            catch (ExecutionException failed)
+            {
+                // Terminal is terminal: the tool answered, and its own answer - a failure
+                // included - carries more for the caller than a timeout label this side cannot
+                // justify. Relabelling it would hide the cause behind "the budget ran out".
+                throw failed;
+            }
+        }
+    }
+
+    /**
+     * Whether a budget is spent.
+     *
+     * <p>The ONE place this question is answered, and it is answered in nanoseconds:
+     * {@link #remainingMillis} truncates, so a remainder under a millisecond reads as zero and
+     * a caller asking "<= 0" would declare the budget gone up to a millisecond early - early
+     * enough to refuse a dispatch, or cancel a tool, that still had time. Milliseconds are for
+     * how LONG to wait; nanoseconds decide WHETHER there is still time.
+     *
+     * @param deadlineNanos the {@link System#nanoTime()} value the budget expires at
+     * @return {@code true} once the deadline has been reached
+     */
+    private static boolean budgetSpent(long deadlineNanos)
+    {
+        return System.nanoTime() - deadlineNanos >= 0;
+    }
+
+    /**
+     * Whether the directly invoked tool has reached a terminal state.
+     *
+     * @param toolFuture holder filled when {@code callTools} hands its future over
+     * @return {@code true} once that future is done; {@code false} while it is absent or running
+     */
+    private static boolean toolFinished(AtomicReference<CompletableFuture<?>> toolFuture)
+    {
+        CompletableFuture<?> future = toolFuture.get();
+        return future != null && future.isDone();
+    }
+
+    /**
      * Milliseconds left of a total budget, never negative.
      *
      * @param deadlineNanos the {@link System#nanoTime()} value the budget expires at
@@ -1460,6 +1556,11 @@ public class WorkmateGateway
     public String callWorkmateTool(String toolName, String argsJson, long timeoutMillis,
         ProgressListener progress) throws GatewayException
     {
+        // Taken BEFORE the reflective setup, not after it: bundle lookup, injector resolution,
+        // the authorization probe and building the call all spend the caller's budget, and a
+        // wait measured afterwards would hand the tool a fresh full budget on top of what setup
+        // already used - so the job could outlive the timeoutSeconds it advertised (#442).
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         // Outside the try, because the catch at the bottom classifies by it: a tool that has
         // started may already have run code, and "retry" would run it twice.
         AtomicBoolean invoked = new AtomicBoolean(false);
@@ -1514,17 +1615,47 @@ public class WorkmateGateway
             }
             Class<?> cancellationTokenClass = requireClass(aiBundle, CANCELLATION_TOKEN);
             AtomicBoolean cancelled = new AtomicBoolean(false);
-            Object token = createCancellationToken(cancellationTokenClass, cancelled);
+            // The future the deadline half of the token judges. Filled in the moment callTools
+            // hands it over; until then there is nothing running that could be cancelled.
+            AtomicReference<CompletableFuture<?>> toolFuture = new AtomicReference<>();
+            // Two halves. Our own give-up, and the budget - but the budget stops mattering the
+            // instant the future is TERMINAL: Workmate may keep polling this token during its
+            // cleanup, and a call that finished in time must not be told it was cancelled just
+            // because the clock moved on afterwards. Judged by the future's own state rather than
+            // by a flag this side sets after the fact, which scheduler delay could postpone.
+            //
+            // Nanoseconds, not remainingMillis(): that helper truncates a sub-millisecond
+            // remainder to zero, which would report the budget spent up to a millisecond early
+            // and abort a tool that was about to finish inside it.
+            Object token = createCancellationToken(cancellationTokenClass, cancelled,
+                () -> !toolFinished(toolFuture) && budgetSpent(deadlineNanos));
             Method callTools = requireMethod(toolsClass, "callTools", callsClass, //$NON-NLS-1$
                 cancellationTokenClass);
             progress.onProgress("Invoking Workmate tool '" + toolName + "' directly."); //$NON-NLS-1$ //$NON-NLS-2$
 
+            // Checked immediately before the invoke, because invoking is what has consequences:
+            // a Workmate tool can run arbitrary code (JShell) or change this configuration, and a
+            // call let out after the advertised budget spends time the caller was never promised.
+            // Nothing has been dispatched yet, so this is the ordinary retryable timeout.
+            if (budgetSpent(deadlineNanos))
+            {
+                throw GatewayException.timedOut();
+            }
             // Same reason as the facade above: a Workmate tool can run arbitrary code (JShell)
             // or change the configuration, and cancelling the wait does not undo that.
             if (!progress.onTryCommit())
             {
                 throw GatewayException.callFailed("the job was already reported as finished " //$NON-NLS-1$
                     + "before tool '" + toolName + "' could be invoked, so it was not invoked"); //$NON-NLS-1$ //$NON-NLS-2$
+            }
+            // Again, after the handshake and not only before it: onTryCommit takes the job
+            // record's lock and can wait there, so the budget may run out between the two. The
+            // conversation path re-checks in the same place for the same reason. Still the
+            // retryable kind - the commit stops the registry from killing the job, but no tool
+            // has been entered, so nothing was left half-done.
+            if (budgetSpent(deadlineNanos))
+            {
+                throw GatewayException.timedOut();
             }
             Object futureValue = invoke(callTools, tools, calls, token);
             // The tool is RUNNING from here on - JShell executes arbitrary code, and other
@@ -1537,10 +1668,16 @@ public class WorkmateGateway
                     + " instead of CompletableFuture"); //$NON-NLS-1$
             }
             CompletableFuture<?> future = (CompletableFuture<?>)futureValue;
+            toolFuture.set(future);
+
             Object result;
             try
             {
-                result = future.get(timeoutMillis, TimeUnit.MILLISECONDS);
+                // Driven by the ABSOLUTE deadline, re-read on every wake: a single relative
+                // wait computed here would start late if this thread is descheduled, and then
+                // run its full length PAST the deadline. callTools also does synchronous work
+                // of its own, which the pre-invoke measurement cannot include.
+                result = awaitToolResult(future, deadlineNanos, cancelled);
             }
             catch (TimeoutException e)
             {
@@ -2329,11 +2466,31 @@ public class WorkmateGateway
 
     private static Object createCancellationToken(Class<?> tokenClass, AtomicBoolean cancelled)
     {
+        return createCancellationToken(tokenClass, cancelled, () -> false);
+    }
+
+    /**
+     * A cancellation token that is ALSO cancelled once {@code expired} says the budget is gone.
+     *
+     * <p>A check placed before the dispatch can only ever be check-then-act: the thread may be
+     * preempted between the two, and no placement fixes that. What does is making the token
+     * itself deadline-aware - Workmate polls it inside its own loop, so a tool entered late,
+     * or still running when the budget ends, sees the cancellation at its next check instead of
+     * depending on this side of the call at all.
+     *
+     * @param tokenClass Workmate's cancellation-token interface
+     * @param cancelled set when this side gives up waiting
+     * @param expired reports whether the caller's budget is spent
+     * @return the proxy to hand to Workmate
+     */
+    private static Object createCancellationToken(Class<?> tokenClass, AtomicBoolean cancelled,
+        BooleanSupplier expired)
+    {
         return Proxy.newProxyInstance(tokenClass.getClassLoader(), new Class<?>[] {tokenClass},
             (proxy, method, args) -> {
                 if ("isCanceled".equals(method.getName())) //$NON-NLS-1$
                 {
-                    return cancelled.get();
+                    return cancelled.get() || expired.getAsBoolean();
                 }
                 if ("toString".equals(method.getName())) //$NON-NLS-1$
                 {
