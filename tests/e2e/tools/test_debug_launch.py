@@ -68,12 +68,16 @@ Fixture inventory used (TestConfiguration, English Names): the project itself
 ("TestConfiguration"). It has NO registered application and NO launch config.
 """
 
+import time
+
 from harness import (
     call,
     assert_error,
     assert_error_quality,
     assert_no_diff,
+    assert_ok,
     e2e_test,
+    requires_live_infobase,
     PROJECT,
 )
 
@@ -324,3 +328,324 @@ def test_unknown_standalone_server_port_conflict_value_is_rejected():
     e = assert_error(r, "unknown standaloneServerPortConflict value")
     assert_error_quality(e, names=[bad], suggests=["cancel", "reassign"],
                          ctx="unknown standaloneServerPortConflict names the bad value and lists the accepted ones")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PER-LAUNCH OVERRIDES (issue #344): /C startup option + the external data
+# processor / report to run on startup (/Execute).
+#
+# A real launch is still out of scope here (no infobase, no client), but the
+# whole point of these arguments is that a BAD one must be refused instead of
+# producing a launch that looks fine and runs nothing - EDT's own delegate only
+# LOGS when it cannot build the dump. So the refusals are the contract, and they
+# are asserted to happen BEFORE any launch configuration is even resolved.
+# ──────────────────────────────────────────────────────────────────────────────
+@e2e_test(tool="debug_launch", kind="read")
+def test_external_object_half_address_is_refused_and_names_the_missing_half():
+    """externalObjectProjectName and externalObjectName are one address in two fields.
+
+    Half of it can only be a mistake, and the refusal must say WHICH half is missing rather
+    than a generic "bad arguments" - the caller cannot see which field they forgot.
+
+    Asserted with a launch configuration name that does NOT exist: the refusal must still be
+    about the arguments, proving the check runs before the configuration is resolved. That
+    ordering is the safety property - both launch modes can terminate a live client session
+    and update the infobase on their way to the launch.
+    """
+    project_only = call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectProjectName": "ExternalObjects",
+    })
+    e = assert_error(project_only, "external object project without an object name")
+    assert_error_quality(
+        e,
+        names=["externalObjectName is missing"],
+        suggests=["externalObjectProjectName and externalObjectName go together"],
+        ctx="the missing half is named, not just rejected",
+    )
+    if "not found" in e and "NoSuchLaunchConfig" in e:
+        raise AssertionError(
+            "the argument check must run BEFORE the launch configuration is resolved, "
+            "got the config-not-found sentinel instead: %s" % e)
+
+    object_only = call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectName": "ExtProc",
+    })
+    e = assert_error(object_only, "external object name without a project")
+    assert_error_quality(
+        e,
+        names=["externalObjectProjectName is missing"],
+        suggests=["never by a"],
+        ctx="the other missing half is named too",
+    )
+    assert_no_diff("a refused launch must not touch the project source")
+
+
+@e2e_test(tool="debug_launch", kind="read")
+def test_external_object_project_must_actually_be_an_external_objects_project():
+    """Pointing externalObjectProjectName at the CONFIGURATION is the obvious first mistake.
+
+    The two projects are different things - projectName is the configuration being debugged,
+    externalObjectProjectName is the project whose nature is external objects - and the
+    refusal has to say so, because "not found" would send the caller looking for a typo in
+    the object name instead.
+    """
+    r = call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectProjectName": PROJECT,
+        "externalObjectName": "ExtProc",
+    })
+    e = assert_error(r, "the configuration project named as the external-objects one")
+    assert_error_quality(
+        e,
+        names=[PROJECT, "not an external-objects project"],
+        suggests=["projectName"],
+        ctx="the refusal separates the two projects instead of reporting a missing object",
+    )
+    assert_no_diff("a refused launch must not touch the project source")
+
+
+@e2e_test(tool="debug_launch", kind="read")
+def test_unknown_external_object_lists_what_the_project_does_have():
+    """A misspelt object name is answered with the names that exist.
+
+    This is the refusal that replaces EDT's silent behaviour: its launch delegate resolves
+    the same object, finds nothing, writes one line to the log and starts the session with no
+    /Execute - a launch that succeeds and runs nothing. Listing the real names turns that into
+    a fixable error.
+    """
+    r = call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectProjectName": "ExternalObjects",
+        "externalObjectName": "NoSuchProcessor_ZZZ_e2e",
+    })
+    e = assert_error(r, "unknown external object")
+    assert_error_quality(
+        e,
+        names=["NoSuchProcessor_ZZZ_e2e", "External object not found"],
+        suggests=["Available"],
+        ctx="the bad name is quoted back and the real ones are listed",
+    )
+    # The fixture holds one external data processor and one external report; both must be
+    # offered, so the listing cannot be a single hardcoded name.
+    for existing in ("ExtProc", "ExtReport"):
+        if existing not in e:
+            raise AssertionError(
+                "the refusal must list the external objects that DO exist, %r missing from: %s"
+                % (existing, e))
+    assert_no_diff("a refused launch must not touch the project source")
+
+
+def _assert_object_resolved(err, ctx):
+    """Assert the call got PAST external-object resolution, whatever it then failed on.
+
+    Two outcomes are both correct, and which one appears depends on the machine rather than on
+    the code under test:
+
+    * on a stand with a 1C platform the object resolves, the dump gate passes, and the call
+      goes on to fail on the missing launch configuration;
+    * on a bare CI runner the object still resolves, but EDT reports it cannot generate dumps
+      at all ("parent project must have a developing application with an infobase") - the
+      pre-launch gate firing exactly as designed, because a launch there really would start a
+      session with no /Execute.
+
+    Pinning either one alone would make the test a statement about the environment. What must
+    hold everywhere is the negative: the failure is NOT the object failing to resolve.
+    """
+    for resolution_failure in ("External object not found",
+                               "not an external-objects project",
+                               "is not an external object kind",
+                               "go together"):
+        if resolution_failure in err:
+            raise AssertionError(
+                "%s: the external object must resolve, but the call failed on %r: %s"
+                % (ctx, resolution_failure, err))
+    for expected in ("Launch configuration not found", "cannot build the external object"):
+        if expected in err:
+            return
+    raise AssertionError(
+        "%s: expected either the launch-configuration sentinel or the dump-precondition "
+        "refusal, got: %s" % (ctx, err))
+
+
+@e2e_test(tool="debug_launch", kind="read")
+def test_a_resolvable_external_object_gets_past_the_argument_check():
+    """The positive half: a REAL object must not be refused by the argument check.
+
+    Without this the three refusals above could all be passing for the wrong reason - a check
+    that rejects everything satisfies them. A launch cannot be driven here (no infobase, no
+    client), so the assertion is that the call proceeds PAST the overrides and fails on the
+    launch configuration instead: the sentinel it reaches is the config-not-found one.
+    """
+    r = call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectProjectName": "ExternalObjects",
+        "externalObjectName": "ExtProc",
+        "startupOption": "SomeStartupCommand",
+    })
+    e = assert_error(r, "a resolvable external object with no launch configuration")
+    _assert_object_resolved(e, "a valid external object is not what the call fails on")
+    assert_no_diff("a refused launch must not touch the project source")
+
+
+@e2e_test(tool="debug_launch", kind="read")
+def test_external_object_name_may_be_qualified_by_kind():
+    """A data processor and a report may share a programmatic name, so the name alone is not a key.
+
+    EDT keys on (name, type) - its own resolver filters by both and the launch stores the type as
+    a separate attribute - so a bare name is accepted only while it is unambiguous, and a
+    qualified one always works. The fixture holds no collision to trigger the ambiguity refusal,
+    but the qualification it would tell the caller to use is exercised here in all three shapes.
+    """
+    # Right kind: resolves, so the call fails on something LATER (see _assert_object_resolved).
+    e = assert_error(call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectProjectName": "ExternalObjects",
+        "externalObjectName": "ExternalDataProcessor.ExtProc",
+    }), "a qualified name of the right kind")
+    _assert_object_resolved(e, "a correctly qualified object must pass the argument check")
+
+    # Right name, WRONG kind: ExtProc is a data processor, not a report.
+    e = assert_error(call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectProjectName": "ExternalObjects",
+        "externalObjectName": "ExternalReport.ExtProc",
+    }), "a qualified name of the wrong kind")
+    assert_error_quality(
+        e,
+        names=["ExtProc", "ExternalReport"],
+        suggests=["Available"],
+        ctx="the kind is part of the address, so the wrong one must not resolve",
+    )
+
+    # A qualifier that is not an external object kind at all.
+    e = assert_error(call("debug_launch", {
+        "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+        "externalObjectProjectName": "ExternalObjects",
+        "externalObjectName": "Catalog.ExtProc",
+    }), "a qualifier that is not an external object kind")
+    assert_error_quality(
+        e,
+        names=["Catalog", "not an external"],
+        suggests=["ExternalDataProcessor", "ExternalReport"],
+        ctx="the refusal names the bad token and the two that work",
+    )
+    assert_no_diff("a refused launch must not touch the project source")
+
+
+@e2e_test(tool="debug_launch", kind="read")
+def test_a_bare_name_resolves_the_same_way_a_qualified_one_does():
+    """One address, two spellings - they must accept the same names.
+
+    The qualified form goes through `MetadataScope.findObject`, which matches programmatic names
+    case-insensitively like the rest of the tool surface. The bare form used to compare exactly,
+    so `extproc` resolved when written as `ExternalDataProcessor.extproc` and was reported
+    missing when written on its own. Whichever spelling is used, the canonical name is what gets
+    stamped onto the launch, so the casing a caller types never reaches EDT either way.
+    """
+    for name in ("extproc", "EXTPROC", "ExternalDataProcessor.extproc"):
+        e = assert_error(call("debug_launch", {
+            "launchConfigurationName": "NoSuchLaunchConfig_ZZZ_e2e",
+            "externalObjectProjectName": "ExternalObjects",
+            "externalObjectName": name,
+        }), "the object addressed as %r" % name)
+        _assert_object_resolved(e, "%r must resolve to ExtProc" % name)
+    assert_no_diff("a refused launch must not touch the project source")
+
+
+@e2e_test(tool="debug_launch", kind="action")
+def test_live_external_processor_is_actually_launched_with_execute():
+    """ATTENDED: a REAL launch reaches EDT and starts a session with the overrides applied.
+
+    Skipped unless EDT_MCP_LIVE_INFOBASE=1, because it spawns a 1C client against a live
+    infobase.
+
+    WHAT THIS PROVES: the arguments survive the whole path - a stamped working copy is accepted
+    by EDT's launch delegate and a debug session really comes up. Waiting for debug_status to
+    report the session is the load-bearing part; without it the test would also pass on a launch
+    that never started.
+
+    WHAT IT DOES NOT PROVE, deliberately and worth knowing before trusting it: that the 1C client
+    actually RAN the processor. If the stamped name/type pair did not match what EDT resolves,
+    the delegate logs and starts the client WITHOUT /Execute - and this test would still pass,
+    because the echoed fields are built locally by the tool before the delegate runs, and
+    debug_status only shows that some session exists. Closing that gap needs the fixture
+    processor to leave an observable trace (write a marker file whose path arrives through the
+    /C startup option, then poll for the file), which is fixture work that cannot be authored
+    blind - it has to be written and RUN against a live infobase. Until then the name/type
+    stamping is pinned by LaunchOverridesTest instead.
+
+    Cleans up after itself - the spawned session is terminated and the throwaway launch
+    configuration removed - so an attended run leaves the workspace as it found it.
+    """
+    requires_live_infobase("spawns a real 1C client running an external data processor")
+
+    cfg_name = "e2e_344_external_object_launch"
+    created = call("create_launch_config", {"projectName": PROJECT, "name": cfg_name})
+    assert_ok(created, "a throwaway runtime-client configuration to launch")
+    app_id = None
+    try:
+        r = call("debug_launch", {
+            "launchConfigurationName": cfg_name,
+            "externalObjectProjectName": "ExternalObjects",
+            "externalObjectName": "ExtProc",
+            "startupOption": "E2E344",
+            "restartIfRunning": True,
+        })
+        assert_ok(r, "launch the external data processor")
+        sc = r.structured
+        if not isinstance(sc, dict):
+            raise AssertionError("JSON tool must populate structuredContent: %r" % sc)
+        # The echo is a LOCAL statement of what the tool applied - it is built before the
+        # delegate runs, so it says "the override was not dropped on our side", not "the
+        # processor ran". Asserted for that narrower reason only.
+        for key, expected in (("externalObjectProjectName", "ExternalObjects"),
+                              ("externalObjectName", "ExtProc"),
+                              ("startupOption", "E2E344")):
+            if sc.get(key) != expected:
+                raise AssertionError(
+                    "the response must echo the applied override %s=%r, got %r" % (key, expected, sc.get(key)))
+
+        # The launch is ASYNCHRONOUS - the tool returns status:"launching" the moment the
+        # background job is scheduled. Without waiting for the session to actually appear, this
+        # test would pass on a launch that never started, and the cleanup below would find
+        # nothing to kill while the client came up afterwards and stayed. So observe it live
+        # first; that observation is also the only thing here that proves EDT accepted the
+        # stamped working copy.
+        app_id = sc.get("applicationId")
+        if not app_id:
+            raise AssertionError("the launch handle carried no applicationId: %r" % sc)
+        live = False
+        deadline = time.time() + 120
+        while time.time() < deadline and not live:
+            st = call("debug_status", {"applicationId": app_id})
+            for lp in (st.structured or {}).get("launches", []) or []:
+                if lp.get("applicationId") == app_id:
+                    live = True
+                    break
+            if not live:
+                time.sleep(2)
+        if not live:
+            raise AssertionError(
+                "debug_status never reported the launch %r as live, so nothing here observed a "
+                "real session - the echo alone would pass on a launch that never started"
+                % (app_id,))
+    finally:
+        term = call("terminate_launch", {"projectName": PROJECT, "applicationId": app_id}
+                    ) if app_id else None
+        call("delete_launch_config", {"name": cfg_name, "confirm": True})
+
+    # Cleanup has to be asserted, not hoped for: a not_found here means the session outlived the
+    # test with its configuration already deleted.
+    assert_ok(term, "terminate the session this test started")
+    term_text = (term.text or "").lower()
+    if "not_found" in term_text:
+        raise AssertionError(
+            "terminate_launch found no live launch although debug_status had just reported one: "
+            "%s" % ((term.text or "")[:300]))
+
+    # The saved configuration is gone, but while it existed the override must never have been
+    # written into it - that is the acceptance criterion the unit test pins on a mock and this
+    # one would have caught for real had applyTo saved the working copy.
+    assert_no_diff("launching a processor must not touch the project source")

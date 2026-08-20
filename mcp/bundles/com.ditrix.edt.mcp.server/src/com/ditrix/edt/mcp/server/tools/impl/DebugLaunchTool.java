@@ -33,6 +33,7 @@ import com.ditrix.edt.mcp.server.utils.DebugServerTargetSupport;
 import com.ditrix.edt.mcp.server.utils.ExternalInfobaseChangesPolicy;
 import com.ditrix.edt.mcp.server.utils.InfobaseAuthDialogSuppressor;
 import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
+import com.ditrix.edt.mcp.server.utils.LaunchOverrides;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils.ExistingClientSession;
 import com.ditrix.edt.mcp.server.utils.LaunchUpdateDialogAutoConfirmer;
@@ -80,6 +81,21 @@ public class DebugLaunchTool implements IMcpTool
     /** Error-log prefix for an asynchronous launch failure. */
     private static final String ERR_ASYNC_PREFIX = "debug_launch failed asynchronously: "; //$NON-NLS-1$
 
+    /**
+     * Input param AND response field: the {@code /C} startup option applied to this launch only.
+     *
+     * <p>Declared as a tool-local constant, not imported from {@link LaunchOverrides}: the
+     * schema/execute parity scan resolves constants from THIS source plus {@code McpKeys}, so a
+     * key that lives elsewhere reads as an undeclared parameter.</p>
+     */
+    private static final String KEY_STARTUP_OPTION = "startupOption"; //$NON-NLS-1$
+
+    /** Input param and response field: the external-objects project holding the object to run. */
+    private static final String KEY_EXTERNAL_OBJECT_PROJECT_NAME = "externalObjectProjectName"; //$NON-NLS-1$
+
+    /** Input param and response field: the external data processor / report to run on startup. */
+    private static final String KEY_EXTERNAL_OBJECT_NAME = "externalObjectName"; //$NON-NLS-1$
+
     @Override
     public String getName()
     {
@@ -119,6 +135,20 @@ public class DebugLaunchTool implements IMcpTool
                     + "answered (with 'override'), so an unattended call never blocks on it.") //$NON-NLS-1$
             .stringProperty("standaloneServerPortConflict", //$NON-NLS-1$
                 StandaloneServerPortConflictPolicy.PARAMETER_DESCRIPTION)
+            .stringProperty(KEY_STARTUP_OPTION,
+                "The 1C /C startup option for THIS launch only (e.g. 'xddRun ...; xddReport ...'); " //$NON-NLS-1$
+                    + "applied to a working copy, the saved EDT configuration is not modified. " //$NON-NLS-1$
+                    + "Runtime-client configs only - an Attach config ignores it and is refused.") //$NON-NLS-1$
+            .stringProperty(KEY_EXTERNAL_OBJECT_PROJECT_NAME,
+                "Name of an EXTERNAL-OBJECTS project (not the configuration being debugged) whose " //$NON-NLS-1$
+                    + "data processor / report to run on startup; pair with externalObjectName. " //$NON-NLS-1$
+                    + "EDT builds the .epf itself - there is no way to run a prebuilt file with " //$NON-NLS-1$
+                    + "breakpoints, so import such a file into a project first.") //$NON-NLS-1$
+            .stringProperty(KEY_EXTERNAL_OBJECT_NAME,
+                "Name of the external data processor / report inside externalObjectProjectName " //$NON-NLS-1$
+                    + "(the object NAME, not a file path); required together with it. Qualify it as " //$NON-NLS-1$
+                    + "'ExternalDataProcessor.Name' / 'ExternalReport.Name' when a processor and a " //$NON-NLS-1$
+                    + "report share the name.") //$NON-NLS-1$
             .booleanProperty("restartIfRunning", //$NON-NLS-1$
                 "Default false: if a matching session is already running, short-circuit with " //$NON-NLS-1$
                     + "alreadyRunning:true and do NOT relaunch (call terminate_launch to restart). " //$NON-NLS-1$
@@ -138,6 +168,12 @@ public class DebugLaunchTool implements IMcpTool
             .stringProperty(McpKeys.PROJECT, "EDT project name associated with the launch") //$NON-NLS-1$
             .stringProperty(McpKeys.APPLICATION_ID, "Application id of the launched configuration") //$NON-NLS-1$
             .booleanProperty("alreadyRunning", "True if a matching session was already alive; re-launch skipped") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty(KEY_STARTUP_OPTION,
+                "Echoed back when a /C startup option was applied to this launch; absent otherwise.") //$NON-NLS-1$
+            .stringProperty(KEY_EXTERNAL_OBJECT_PROJECT_NAME,
+                "Echoed back when an external object was launched; absent otherwise.") //$NON-NLS-1$
+            .stringProperty(KEY_EXTERNAL_OBJECT_NAME,
+                "The external data processor / report this launch runs; absent when none was requested.") //$NON-NLS-1$
             .stringProperty("mode", "Launch mode of the session (e.g. debug, run)") //$NON-NLS-1$ //$NON-NLS-2$
             .stringProperty(KEY_STATUS, "\"launching\" when the launch was dispatched asynchronously and is " //$NON-NLS-1$
                 + "still starting; absent on the alreadyRunning short-circuit. Poll debug_status for readiness.") //$NON-NLS-1$
@@ -185,11 +221,26 @@ public class DebugLaunchTool implements IMcpTool
                 + StandaloneServerPortConflictPolicy.acceptedValues()).toJson();
         }
 
+        // Read here, in execute(), rather than inside LaunchOverrides: rule #6 parity is checked
+        // by scanning THIS method for the project's accessor idioms.
+        LaunchOverrides overrides = LaunchOverrides.of(
+            JsonUtils.extractStringArgument(params, KEY_STARTUP_OPTION),
+            JsonUtils.extractStringArgument(params, KEY_EXTERNAL_OBJECT_PROJECT_NAME),
+            JsonUtils.extractStringArgument(params, KEY_EXTERNAL_OBJECT_NAME));
+        // Validated up front, alongside the enum parses above and before EITHER launch mode: both
+        // of them can terminate a live client session and update the infobase on the way to the
+        // launch, and a mistyped external object must not cost the caller those.
+        LaunchOverrides.Prepared prepared = overrides.prepare();
+        if (prepared.errorJson != null)
+        {
+            return prepared.errorJson;
+        }
+
         // Mode 1: explicit config name — no project/application required.
         if (configName != null && !configName.isEmpty())
         {
             return launchByConfigName(configName, updateBeforeLaunch, restartIfRunning, policy,
-                portPolicy);
+                portPolicy, overrides, prepared);
         }
 
         // Mode 2: project + application (runtime-client only).
@@ -213,7 +264,7 @@ public class DebugLaunchTool implements IMcpTool
         }
 
         return launchDebug(projectName, applicationId, updateBeforeLaunch, restartIfRunning, policy,
-            portPolicy);
+            portPolicy, overrides, prepared);
     }
 
     /**
@@ -232,9 +283,10 @@ public class DebugLaunchTool implements IMcpTool
      * Launches a specific EDT debug configuration by name.
      * Works for both runtime-client and Attach configuration types.
      */
-    private String launchByConfigName(String configName, boolean updateBeforeLaunch,
+    private String launchByConfigName(String configName, boolean updateBeforeLaunch, // NOSONAR one argument per independent caller-visible decision; a parameter object would only rename them
         boolean restartIfRunning, ExternalInfobaseChangesPolicy policy,
-        StandaloneServerPortConflictPolicy portPolicy)
+        StandaloneServerPortConflictPolicy portPolicy, LaunchOverrides overrides,
+        LaunchOverrides.Prepared prepared)
     {
         try
         {
@@ -258,6 +310,16 @@ public class DebugLaunchTool implements IMcpTool
             String configProject = LaunchConfigUtils.readAttribute(config,
                 LaunchConfigUtils.ATTR_PROJECT_NAME, ""); //$NON-NLS-1$
             String effectiveAppId = LaunchConfigUtils.getApplicationIdFor(config);
+
+            // Asked here, the moment isAttach is known, and NOT where the overrides are stamped:
+            // the existing-session block below can terminate a live client when
+            // restartIfRunning=true, and a request that is going to be refused anyway must not
+            // cost somebody their session on the way to the refusal.
+            String attachRefusal = prepared.attachRefusalOrNull(config, isAttach);
+            if (attachRefusal != null)
+            {
+                return attachRefusal;
+            }
 
             // Unified existing-session decision. One
             // (project, app-id) → at most one live CLIENT session, with the
@@ -323,14 +385,24 @@ public class DebugLaunchTool implements IMcpTool
             // to their owners: a port policy forwarded here would arm the matcher for the whole
             // Attach window and could cancel — or, with reassign, re-address — a server some other
             // launch or a human is starting (review of #435).
-            String launchError = performLaunch(config, updateBeforeLaunch,
+            // Last step before the launch, so every guard above still reads the SAVED
+            // configuration: the overrides change what the client is told to run, never the
+            // project / application identity those guards key on.
+            LaunchOverrides.Applied applied = prepared.applyTo(config, isAttach);
+            if (applied.errorJson != null)
+            {
+                return applied.errorJson;
+            }
+
+            String launchError = performLaunch(applied.config, updateBeforeLaunch,
                 isAttach ? null : policy, isAttach ? null : portPolicy);
             if (launchError != null)
             {
                 return ToolResult.error("Failed to launch debug session: " + launchError).toJson(); //$NON-NLS-1$
             }
 
-            return buildLaunchSuccess(config, typeId, isAttach, configProject, effectiveAppId);
+            return buildLaunchSuccess(config, typeId, isAttach, configProject, effectiveAppId,
+                overrides, prepared);
         }
         catch (Exception e)
         {
@@ -368,8 +440,9 @@ public class DebugLaunchTool implements IMcpTool
      * Builds the success response for the by-name launch path. Pure formatting of
      * read-only inputs; no behavioural change relative to the inline builder.
      */
-    private String buildLaunchSuccess(ILaunchConfiguration config, String typeId, boolean isAttach,
-        String configProject, String effectiveAppId)
+    private String buildLaunchSuccess(ILaunchConfiguration config, String typeId, boolean isAttach, // NOSONAR one argument per independent caller-visible decision; a parameter object would only rename them
+        String configProject, String effectiveAppId, LaunchOverrides overrides,
+        LaunchOverrides.Prepared prepared)
     {
         ToolResult result = ToolResult.success()
             .put(KEY_LAUNCH_CONFIGURATION, config.getName())
@@ -392,15 +465,46 @@ public class DebugLaunchTool implements IMcpTool
         {
             result.put(McpKeys.APPLICATION_ID, effectiveAppId);
         }
-        return result.toJson();
+        return echoOverrides(result, overrides, prepared).toJson();
+    }
+
+    /**
+     * Reports the applied overrides back on a successful launch.
+     *
+     * <p>Echoed rather than left implicit because the failure mode being guarded against is a
+     * launch that looks successful while the processor never ran: a response naming what it is
+     * running lets the caller - and the e2e suite - tell the two apart without reading the EDT
+     * log. Absent overrides add no keys, so an ordinary launch's payload is unchanged.</p>
+     *
+     * @param result the success payload being built
+     * @param overrides what the caller asked for
+     * @return the same payload, for chaining
+     */
+    private static ToolResult echoOverrides(ToolResult result, LaunchOverrides overrides,
+        LaunchOverrides.Prepared prepared)
+    {
+        if (!LaunchOverrides.blank(overrides.startupOption()))
+        {
+            result.put(KEY_STARTUP_OPTION, overrides.startupOption());
+        }
+        // The RESOLVED name, so the echo names what is running - a qualified request resolves to
+        // a bare name, and that bare name is what was stamped onto the launch.
+        String resolved = prepared.resolvedExternalObjectName();
+        if (!LaunchOverrides.blank(resolved))
+        {
+            result.put(KEY_EXTERNAL_OBJECT_PROJECT_NAME, overrides.externalObjectProjectName());
+            result.put(KEY_EXTERNAL_OBJECT_NAME, resolved);
+        }
+        return result;
     }
 
     /**
      * Legacy path: launch a runtime-client config matched by project+application.
      */
-    private String launchDebug(String projectName, String applicationId, boolean updateBeforeLaunch,
+    private String launchDebug(String projectName, String applicationId, boolean updateBeforeLaunch, // NOSONAR one argument per independent caller-visible decision; a parameter object would only rename them
         boolean restartIfRunning, ExternalInfobaseChangesPolicy policy,
-        StandaloneServerPortConflictPolicy portPolicy)
+        StandaloneServerPortConflictPolicy portPolicy, LaunchOverrides overrides,
+        LaunchOverrides.Prepared prepared)
     {
         try
         {
@@ -503,19 +607,27 @@ public class DebugLaunchTool implements IMcpTool
                 return dupResult;
             }
 
+            // See the by-name path: applied last so the guards above read the saved config.
+            // This path is runtime-client by construction, so isAttach is false.
+            LaunchOverrides.Applied applied = prepared.applyTo(matchingConfig, false);
+            if (applied.errorJson != null)
+            {
+                return applied.errorJson;
+            }
+
             String launchError =
-                performLaunch(matchingConfig, updateBeforeLaunch, policy, portPolicy);
+                performLaunch(applied.config, updateBeforeLaunch, policy, portPolicy);
             if (launchError != null)
             {
                 return ToolResult.error("Failed to launch debug session: " + launchError).toJson(); //$NON-NLS-1$
             }
 
-            return ToolResult.success()
+            return echoOverrides(ToolResult.success()
                 .put(McpKeys.PROJECT, projectName)
                 .put(McpKeys.APPLICATION_ID, applicationId)
                 .put(KEY_LAUNCH_CONFIGURATION, configName)
                 .put(KEY_CONFIGURATION_TYPE, LaunchConfigUtils.getConfigTypeId(matchingConfig))
-                .put(KEY_ATTACH, false)
+                .put(KEY_ATTACH, false), overrides, prepared)
                 .put("mode", "debug") //$NON-NLS-1$ //$NON-NLS-2$
                 .put(KEY_STATUS, "launching") //$NON-NLS-1$
                 .put(McpKeys.MESSAGE, "Debug session is starting asynchronously. The 1C client may show " //$NON-NLS-1$
