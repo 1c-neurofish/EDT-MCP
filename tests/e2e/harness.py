@@ -39,6 +39,11 @@ REPO_ROOT = os.path.abspath(os.path.join(HARNESS_DIR, "..", ".."))
 PROJECT_REL = os.environ.get("MCP_PROJECT_REL", "tests/" + PROJECT)  # git path rel to repo root (fwd slashes for git)
 PROJECT_DIR = os.path.join(REPO_ROOT, *PROJECT_REL.split("/"))       # absolute project dir
 
+# Wall-clock when this run started (module import happens once, before the first test).
+# The EDT log ratchet uses it to look only at entries THIS run produced, so a stale workspace
+# log full of yesterday's noise cannot fail - or silently pass - today's run.
+RUN_STARTED_AT = time.time()
+
 # The YAXUnit test suite lives in a SEPARATE EDT extension project (V8ExtensionNature)
 # named "<base>.tests" — breakpoints in the test modules resolve against THIS project,
 # not the base configuration. Override with MCP_TESTS_PROJECT if the layout changes.
@@ -478,7 +483,7 @@ def call(tool, arguments):
             raise
         result = Result(raw)
         if not _is_transient_building(result) or time.time() >= deadline:
-            _record_outcome(tool, result.is_error)
+            _record_outcome(tool, result.is_error, result.structured)
             return result
         attempt += 1
         time.sleep(min(2 * attempt, 10))
@@ -504,8 +509,8 @@ DEEP_MUTATION_TOOLS = frozenset({
     "clean_project", "create_project", "delete_project",
 })
 
-# Tools that change the BM model. A SUCCESSFUL call to any of them forfeits the shortcut
-# outright, whatever the later evidence says.
+# Tools that change the BM model. A SUCCESSFUL call, an observed post-commit error, or an error
+# whose mutating API cannot report rollback forfeits the shortcut, whatever later evidence says.
 #
 # Because the evidence has a blind spot, and this closes it: a metadata write can succeed
 # with persisted=false — the transaction changed the in-memory model while the fixture stays
@@ -517,11 +522,18 @@ DEEP_MUTATION_TOOLS = frozenset({
 # the Java side and is missing here fails the suite. Hand-maintained membership silently rots -
 # apply_quick_fix landed on master mutating the model, and this set did not know about it.
 MODEL_MUTATION_TOOLS = frozenset({
-    "create_metadata", "modify_metadata", "write_module_source", "write_predefined_items",
+    "create_metadata", "modify_metadata", "write_module_source",
     "apply_quick_fix", "build_external_objects",
-    # Writers whose write happens OUTSIDE our code: both call LanguageTool through reflection, so
-    # no marker in this repository's sources can reveal them. The ratchet pins them by name for
-    # exactly that reason - see _REFLECTIVE_WRITERS in test_mutation_set_ratchet.py.
+    # dcs authors schemas / settings / dynamic lists. It belongs here rather than in
+    # DEEP_MUTATION_TOOLS because an ordinary refusal does not move the model: the writer validates
+    # the request before the first eSet. The exception is a post-commit force-export scheduling
+    # failure; every post-commit error carries mutationCommitted:true, and an opaque in-flight
+    # failure carries mutationOutcomeUnknown:true. Both forfeit the shortcut without making an
+    # ordinary negative test do so.
+    "dcs",
+    # Writers whose write happens OUTSIDE our code: both call LanguageTool through reflection.
+    # Their entry points now mark an exception after invoke() as outcome-unknown, but source
+    # scanning still cannot discover their membership; the ratchet pins their names explicitly.
     "generate_translation_strings", "translate_configuration",
 }) | DEEP_MUTATION_TOOLS
 
@@ -529,7 +541,8 @@ _CALLED_TOOLS = set()
 _BASELINE_INVENTORY = None
 _BASELINE_DETAILS = None
 
-# A mutating call that SUCCEEDED. One is enough to forfeit the shortcut for the whole test.
+# A mutating call that succeeded, committed before failing, or entered an opaque mutation whose
+# rollback outcome is unknown. Any one is enough to forfeit the shortcut for the whole test.
 _MUTATION_CONFIRMED = False
 # Mutating calls issued whose outcome was never read back (connection reset, truncated body,
 # timeout). The server may well have committed them, so while this is non-zero the model counts
@@ -555,13 +568,22 @@ def _record_attempt(tool):
         _MUTATIONS_UNRESOLVED += 1
 
 
-def _record_outcome(tool, is_error):
-    """Called once the server's answer has actually been read."""
+def _record_outcome(tool, is_error, structured):
+    """Called once the server's answer has actually been read.
+
+    Mutation-bearing failures are identified by boolean response fields, never their prose.
+    ToolResult emits mutationCommitted for an observed commit and mutationOutcomeUnknown for an
+    entered opaque/in-flight mutation, so wording changes cannot accidentally re-arm the shortcut.
+    """
     global _MUTATIONS_UNRESOLVED, _MUTATION_CONFIRMED
     if tool not in MODEL_MUTATION_TOOLS:
         return
     _MUTATIONS_UNRESOLVED = max(0, _MUTATIONS_UNRESOLVED - 1)
-    if not is_error:
+    mutation_committed = (isinstance(structured, dict)
+                          and structured.get("mutationCommitted") is True)
+    mutation_unknown = (isinstance(structured, dict)
+                        and structured.get("mutationOutcomeUnknown") is True)
+    if not is_error or mutation_committed or mutation_unknown:
         _MUTATION_CONFIRMED = True
 
 
@@ -1494,16 +1516,8 @@ def assert_no_substantive_diff(ctx=""):
             _fail("new/deleted/renamed file under %s [%s]:\n%s" % (PROJECT_REL, ctx, status[:500]))
 
 
-def tree_snapshot():
-    """Capture the BASE fixture's full on-disk state for a later 'changed NOTHING'
-    comparison: porcelain status (every untracked file listed individually), the
-    tracked content diff vs HEAD (staged + unstaged), and a content hash of each
-    untracked file (so an in-place rewrite of a brand-new file is caught too).
-
-    For tests whose SETUP legitimately dirties the tree (e.g. seeding a referenced
-    catalog before probing a blocked delete): plain assert_no_diff would flag the
-    seeding itself. Snapshot AFTER the seeding, run the operation under test, then
-    assert_tree_unchanged(snapshot) — asserting the operation added nothing on top."""
+def _tree_sample():
+    """One instantaneous read of the fixture's on-disk state. See tree_snapshot()."""
     status = _git("status", "--porcelain", "--untracked-files=all", "--", PROJECT_REL).stdout
     diff_head = _git("diff", "HEAD", "--", PROJECT_REL).stdout
     hashes = {}
@@ -1518,6 +1532,44 @@ def tree_snapshot():
                 except OSError:
                     hashes[path] = "<unreadable>"
     return {"status": status, "diff": diff_head, "untracked": hashes}
+
+
+def tree_snapshot(stable_for=0.75, timeout=8):
+    """Capture the BASE fixture's full on-disk state for a later 'changed NOTHING'
+    comparison: porcelain status (every untracked file listed individually), the
+    tracked content diff vs HEAD (staged + unstaged), and a content hash of each
+    untracked file (so an in-place rewrite of a brand-new file is caught too).
+
+    For tests whose SETUP legitimately dirties the tree (e.g. seeding a referenced
+    catalog before probing a blocked delete): plain assert_no_diff would flag the
+    seeding itself. Snapshot AFTER the seeding, run the operation under test, then
+    assert_tree_unchanged(snapshot) — asserting the operation added nothing on top.
+
+    SETTLED, not instantaneous. EDT exports asynchronously, so a snapshot taken the moment
+    a test finishes seeding can capture a tree the exporter is still writing — and then the
+    exporter catching up, NOT the operation under test, is what assert_tree_unchanged
+    reports. That is a real flake, and it reads as an accusation: "a rejected call must
+    change nothing" failing with `tracked diff changed (before 713 chars, after 677 chars)`
+    — the diff SHRANK while the call under test was busy being refused.
+
+    So sample until two consecutive reads agree. Both sides of the comparison are then
+    states the exporter has finished with, which is what makes the difference between them
+    attributable to the operation. Settling the AFTER side does not hide a late write the
+    operation caused — it waits for it, so it is caught rather than raced against.
+
+    A tree that never settles within the timeout returns its last sample: the assertion is
+    then no worse off than before this settling existed, and failing here would blame the
+    test for a stand that is busy for reasons of its own.
+    """
+    previous = _tree_sample()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(stable_for)
+        current = _tree_sample()
+        if current == previous:
+            return current
+        previous = current
+    return previous
 
 
 def assert_tree_unchanged(before, ctx=""):
@@ -1891,9 +1943,17 @@ def wait_until_no_running_launch(config_name=None, timeout=60):
 REGISTRY = []
 
 
-def e2e_test(tool, kind="read"):
-    """Register a test function. kind: 'read' | 'write' | 'action'."""
+def e2e_test(tool, kind="read", last=False):
+    """Register a test function. kind: 'read' | 'write' | 'action'.
+
+    last=True defers the test to the END of the run. Use it only when the SUBJECT of the test
+    is the run itself rather than one tool's behaviour - the EDT-log ratchet, which can only
+    judge what the suite logged once the suite has logged it. Registry order is import order,
+    so without this such a test lands wherever its filename sorts and certifies a window that
+    has barely opened.
+    """
     def deco(fn):
-        REGISTRY.append({"func": fn, "tool": tool, "kind": kind, "name": fn.__name__})
+        REGISTRY.append({"func": fn, "tool": tool, "kind": kind, "name": fn.__name__,
+                         "last": last})
         return fn
     return deco
