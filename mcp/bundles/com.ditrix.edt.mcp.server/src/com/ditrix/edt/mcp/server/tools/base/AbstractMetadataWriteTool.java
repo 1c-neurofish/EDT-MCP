@@ -49,6 +49,20 @@ import com.google.gson.JsonParser;
 public abstract class AbstractMetadataWriteTool implements IMcpTool
 {
     /**
+     * Whether this tool's result depends on VALIDATION having finished, not just on the model.
+     * <p>
+     * The default is {@code false}: a create or a modify needs the metadata model, and MD is
+     * AFTER_SYNC, so the model gate proves what they use. Issue #495 is precisely about not making
+     * those wait hours for the validation checks.
+     *
+     * @return {@code true} to gate on the strict project state instead of the model state
+     */
+    protected boolean requiresFullDerivedData()
+    {
+        return false;
+    }
+
+    /**
      * How long to wait for a write's {@code .mdo} export to reach disk before refusing.
      * <p>
      * The same value {@code rename_metadata_object} already uses to let the pipeline settle, and
@@ -93,7 +107,9 @@ public abstract class AbstractMetadataWriteTool implements IMcpTool
         // lookup. Only the transient BUILDING state is refused here; a missing/closed
         // project falls through to resolveProjectAndConfig's value-naming error. Checked
         // on the calling thread before marshalling onto the UI thread.
-        String building = ProjectStateChecker.buildingErrorOrNull(params.get("projectName")); //$NON-NLS-1$
+        String building = requiresFullDerivedData()
+            ? ProjectStateChecker.buildingErrorOrNull(params.get("projectName")) //$NON-NLS-1$
+            : ProjectStateChecker.modelBuildingErrorOrNull(params.get("projectName")); //$NON-NLS-1$
         if (building != null)
         {
             return ToolResult.error(building).toJson();
