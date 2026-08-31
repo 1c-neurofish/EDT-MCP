@@ -17,8 +17,10 @@ item count, and the OWNER FQN is the load-bearing on-disk proof).
 
 reset: kind="write-metadata" -> reset_fixture()+reset_model() after each test.
 
-Fixture (shipped TestConfiguration): CommonAttribute.CommonAttribute has NO <content> yet;
-Catalog.Catalog is a valid common-attribute owner; CommonModule.OK is a NON-owner kind.
+Fixture (shipped TestConfiguration): CommonAttribute.CommonAttribute has NO <content> yet and uses
+dataSeparation=DontUse; Catalog.Catalog is a valid owner for that simple common attribute;
+CommonModule.OK is a NON-owner kind. The fixture has no Constant and no separator common attribute,
+so the separator/Constant scenario creates both inside its test.
 """
 
 from harness import (
@@ -30,6 +32,8 @@ from harness import (
     assert_no_diff,
     poll_diff_contains,
     poll_disk_lacks,
+    read_disk,
+    wait_for_project_ready,
     e2e_test,
     PROJECT,
 )
@@ -47,6 +51,18 @@ def _details_text(fqn=CA):
     r = call("get_metadata_details", {"projectName": PROJECT, "objectFqns": [fqn]})
     assert_ok(r, "get_metadata_details for " + fqn)
     return r.text
+
+
+def _create_ok(fqn, ctx):
+    """Create setup metadata and wait until the dependent write guard permits the next mutation."""
+    r = call("create_metadata", {"projectName": PROJECT, "fqn": fqn})
+    assert_ok(r, ctx)
+    wait_for_project_ready()
+    return r
+
+
+def _common_attribute_mdo(name):
+    return "src/CommonAttributes/%s/%s.mdo" % (name, name)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -78,6 +94,135 @@ def test_add_owner_persists_and_reads_back():
     after = _details_text()
     assert_contains(after, "CommonAttributeContentItem",
                     "the model read-back must show the new content item")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Happy — a separator common attribute accepts a Constant owner (#507)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_separator_accepts_constant_owner():
+    separator_name = "E2EDataSeparator507"
+    constant_name = "E2EDataSeparatorConstant507"
+    separator_fqn = "CommonAttribute." + separator_name
+    constant_fqn = "Constant." + constant_name
+    owner_token = "<metadata>%s</metadata>" % constant_fqn
+
+    _create_ok(constant_fqn, "create the Constant owner for the separator")
+    _create_ok(separator_fqn, "create the common attribute that will become a separator")
+
+    make_separator = call("modify_metadata", {
+        "projectName": PROJECT,
+        "fqn": separator_fqn,
+        "properties": [{"name": "dataSeparation", "value": "Separate"}],
+    })
+    assert_ok(make_separator, "set the target common attribute dataSeparation to Separate")
+    assert make_separator.structured.get("persisted") is True, \
+        "the separator property must persist before attaching an owner: %r" % (make_separator.structured,)
+    wait_for_project_ready()
+
+    before = _details_text(separator_fqn)
+    assert "CommonAttributeContentItem" not in before, \
+        "the new separator must start with no content rows:\n%s" % before[:500]
+
+    attach = call("modify_metadata", {
+        "projectName": PROJECT,
+        "fqn": separator_fqn,
+        "content": [{"metadata": constant_fqn, "use": "Use"}],
+    })
+    assert_ok(attach, "attach a Constant owner to a separator common attribute")
+    counts = attach.structured.get("content") or {}
+    # THE assertion of #507: a Constant is only in EDT's data-separable owner set, so an accepted
+    # attach proves the writer read the target's live dataSeparation and picked the separator
+    # predicate. Before the fix this call was refused outright.
+    assert counts.get("added") == 1 and counts.get("updated") == 0 and counts.get("removed") == 0, \
+        "the Constant must be attached as one fresh owner: %r" % (attach.structured,)
+    assert attach.structured.get("persisted") is True, \
+        "the Constant owner must persist to disk: %r" % (attach.structured,)
+
+    # DISK FIRST: modify_metadata submitted and drained this target's export. The exact owner element
+    # proves the Constant landed in this common attribute's content rather than merely existing.
+    on_disk = read_disk(_common_attribute_mdo(separator_name))
+    # NOT asserted: a literal "<dataSeparation>Separate</dataSeparation>" line. EDT omits the
+    # property when it equals the serialization default, and Separate IS that default - the whole
+    # ERP configuration shows the same shape, where every real separator has no <dataSeparation>
+    # line at all while the four language common attributes write <dataSeparation>DontUse</...>
+    # explicitly. What the disk CAN prove is the negative: the target is not a simple attribute.
+    assert "<dataSeparation>DontUse</dataSeparation>" not in on_disk, \
+        "the target must not have fallen back to a simple (DontUse) common attribute:\n%s" \
+        % on_disk[:600]
+    assert owner_token in on_disk, \
+        "the Constant owner must land in the separator's <content> block on disk"
+
+    # MODEL read-back: #505 does not yet render owner names, but a fresh target changing from zero to
+    # one CommonAttributeContentItem still proves get_metadata_details sees the attached content row.
+    after = _details_text(separator_fqn)
+    assert after.count("CommonAttributeContentItem") == 1, \
+        "get_metadata_details must read back exactly one attached owner row:\n%s" % after[:700]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Happy — remove remains a cleanup operation after the target kind makes the row illegal
+# ──────────────────────────────────────────────────────────────────────────────
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_remove_owner_illegal_for_current_target_kind_succeeds():
+    attribute_name = "E2EIllegalOwnerCleanup507"
+    constant_name = "E2EIllegalOwnerCleanupConstant507"
+    attribute_fqn = "CommonAttribute." + attribute_name
+    constant_fqn = "Constant." + constant_name
+    owner_token = "<metadata>%s</metadata>" % constant_fqn
+    attribute_mdo = _common_attribute_mdo(attribute_name)
+
+    _create_ok(constant_fqn, "create the separator-only Constant owner")
+    _create_ok(attribute_fqn, "create the common attribute for the cleanup case")
+
+    make_separator = call("modify_metadata", {
+        "projectName": PROJECT,
+        "fqn": attribute_fqn,
+        "properties": [{"name": "dataSeparation", "value": "Separate"}],
+    })
+    assert_ok(make_separator, "make the target a separator before attaching the Constant")
+    wait_for_project_ready()
+
+    attach = call("modify_metadata", {
+        "projectName": PROJECT,
+        "fqn": attribute_fqn,
+        "content": [{"op": "add", "metadata": constant_fqn, "use": "Use"}],
+    })
+    assert_ok(attach, "attach the Constant while its class is legal for the target")
+    assert (attach.structured.get("content") or {}).get("added") == 1, \
+        "the setup must attach exactly one Constant owner: %r" % (attach.structured,)
+
+    make_simple = call("modify_metadata", {
+        "projectName": PROJECT,
+        "fqn": attribute_fqn,
+        "properties": [{"name": "dataSeparation", "value": "DontUse"}],
+    })
+    assert_ok(make_simple, "change the populated target to the simple common-attribute kind")
+    wait_for_project_ready()
+
+    before_remove = read_disk(attribute_mdo)
+    assert "<dataSeparation>DontUse</dataSeparation>" in before_remove, \
+        "the target must now be simple before exercising the cleanup path:\n%s" % before_remove[:700]
+    assert owner_token in before_remove, \
+        "the now-illegal Constant row must still exist before the removal call"
+
+    # WHY: an add must reject this Constant for a simple target, but applying that same predicate to
+    # remove creates a dead end: the only operation that can repair the invalid row would reject it.
+    # Removal therefore still resolves the real owner and listed row, while deliberately skipping
+    # the owner-class rule selected by the target's CURRENT dataSeparation.
+    remove = call("modify_metadata", {
+        "projectName": PROJECT,
+        "fqn": attribute_fqn,
+        "content": [{"op": "remove", "metadata": constant_fqn}],
+    })
+    assert_ok(remove, "remove the Constant that is illegal for the target's current simple kind")
+    counts = remove.structured.get("content") or {}
+    assert counts.get("removed") == 1 and counts.get("added") == 0 and counts.get("updated") == 0, \
+        "the cleanup call must remove exactly the obsolete row: %r" % (remove.structured,)
+    poll_disk_lacks(attribute_mdo, owner_token,
+                    ctx="the now-illegal Constant owner row must be removable from disk")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -231,12 +376,28 @@ def test_add_non_owner_kind_is_error():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Negative — remove an owner that is not attached is a clean error (nothing written)
+# Negative — remove still requires a real owner and a row that is actually attached
 # ──────────────────────────────────────────────────────────────────────────────
 
 @e2e_test(tool="modify_metadata", kind="write-metadata")
+def test_remove_unresolvable_owner_is_error():
+    missing = "Catalog.NoSuchOwnerToRemove_e2e"
+    # Removal skips only the class predicate; it must still name a real metadata object so a typo
+    # cannot masquerade as a successful cleanup.
+    r = call("modify_metadata", {
+        "projectName": PROJECT, "fqn": CA,
+        "content": [{"op": "remove", "metadata": missing}],
+    })
+    e = assert_error(r, "detach an owner object that does not exist")
+    assert_error_quality(e, names=[missing],
+                         ctx="removing a non-existent owner still names the unresolved FQN")
+    assert_no_diff("a rejected removal of a non-existent owner must change nothing")
+
+
+@e2e_test(tool="modify_metadata", kind="write-metadata")
 def test_remove_not_attached_owner_is_error():
-    # The fixture common attribute has no content, so removing any owner is a clean, actionable error.
+    # Removal skips only the class predicate; a real owner must still have an attached row. This
+    # preserves the existing typo/stale-state signal instead of turning remove into a silent no-op.
     r = call("modify_metadata", {
         "projectName": PROJECT, "fqn": CA,
         "content": [{"op": "remove", "metadata": OWNER}],
